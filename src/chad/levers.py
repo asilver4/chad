@@ -338,6 +338,49 @@ LEVERS: dict[str, Lever] = {
         "still in context. OFF re-appends duplicate output verbatim.",
         "iter14"),
 
+    # --- iter-15: the audit-silent early-quit class. The no-empty-diff hard stop
+    #     sits ABOVE the done-audit in both accept paths, so a done with no
+    #     landed+verified change ends the turn before the audit can engage: a
+    #     progress note carrying the model's own completion claim gets banked, and
+    #     each relaunch re-dones into the same stop until the continue allowance
+    #     is exhausted — gate order, not the audit's own scoping, kept the
+    #     task-grounded steer away from exactly the turns that needed it. --------
+    "audit_churn_handoff": Lever(
+        "When the no-empty-diff gate is about to hard-stop a done/final-answer (no "
+        "landed+verified change on an action task) and the done-audit has not fired "
+        "this turn, bounce ONCE with the audit steer (task requirement lines quoted "
+        "+ stat-level path facts, truthful promise: acceptance follows a landed+"
+        "verified change) instead of ending the turn — the steer lands in context "
+        "with the turn's work rather than in a banked progress note the relaunch "
+        "re-confirms. The next empty-diff done hard-stops exactly as before (churn "
+        "capped, not replaced); latch and bounce caps shared with done_audit. "
+        "Inert unless done_audit is also enabled. OFF restores the immediate stop.",
+        "iter15"),
+
+    "bash_auto_background": Lever(
+        "On timeout, move a still-running bash command to the background instead of "
+        "killing its process group: its output keeps streaming to a spill file whose "
+        "path the result names, and an `[exit <code> at HH:MM:SS]` footer marks "
+        "completion. The spill file IS the interface — no new tool, no task registry "
+        "for the model to learn, since it can already read and grep a path. A killed "
+        "install/build/download costs a full re-run of work already paid for, and "
+        "`cmd &` (what the kill message suggests when off) hands back a process with "
+        "nowhere to put its output. Bounded: at most 2 concurrent, an absolute "
+        "lifetime each, and every one of them terminated when chad exits or is "
+        "signalled; a user interrupt still kills outright. OFF restores the "
+        "kill-and-advise path exactly.",
+        "iter15"),
+    "capped_think_credit": Lever(
+        "Credit a generation that ended inside <think> — no closing tag, whatever "
+        "stopped it — as reasoning in full, not zero. The turn think budget only "
+        "counted think tokens when the model closed the block or a stop CONDITION "
+        "fired, so a generation truncated at the raw token cap mid-reasoning (the "
+        "reasoning_length_stop telemetry already names it) was invisible to the "
+        "budget meant to bound it — and those are the largest generations there "
+        "are, one full cap each. OFF restores the blind accounting; no threshold "
+        "or clamp changes either way, only what the budget can see.",
+        "iter15"),
+
     # --- from the LangChain harness-tuning playbook. -------------------------------
     "compact_notice": Lever(
         "After compaction, inject an in-band message telling the model its context was "

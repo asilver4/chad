@@ -2,6 +2,37 @@
 
 Notable, user-visible changes.
 
+## [1.0.5] — 2026-07-24
+
+Completion and reasoning-budget accuracy, plus an opt-in for long-running commands.
+Each behavior change is individually reversible via `CHAD_DISABLE`.
+
+- **A `done` with nothing landed gets the task's own requirements back, once.**
+  Previously, ending a turn with no landed-and-verified change stopped the turn
+  immediately and banked a progress note — so the done-audit, which quotes the task
+  statement's requirement lines and reports what actually exists on disk, never ran
+  on exactly the turns that needed it most. That ending now hands off to a single
+  audit bounce first, in context with the work the turn already did; a second empty
+  ending stops as before. (`audit_churn_handoff`)
+- **Reasoning truncated at the token cap now counts against the reasoning budget.**
+  A generation that hit the raw output cap while still inside `<think>` credited
+  zero reasoning tokens, so the per-turn budget was blind to the largest thinks
+  there are — one full cap each — and its throttle never engaged on the turns that
+  overspent the most. Those tokens are now counted. No threshold or clamp changed;
+  only what the budget can see. (`capped_think_credit`)
+- **A `bash` command that outruns its timeout keeps running instead of being killed.**
+  It moves to the background rather than having its process group killed: output keeps
+  streaming to a file named in the result, ending with an `[exit <code> at HH:MM:SS]`
+  footer when it finishes, so a long install, build, or download is not thrown away
+  and re-run from zero. Bounded by design — at most two at a time, an absolute
+  lifetime each, and all of them terminated when chad exits or is signalled. A user
+  interrupt still kills outright. (`bash_auto_background`)
+
+Also fixed:
+
+- **`chad --version` reported the wrong version.** `__version__` had drifted from the
+  packaged version, so 1.0.3 and 1.0.4 both identified themselves as 1.0.2.
+
 ## [1.0.4] — 2026-07-22
 
 Tool-result economics: three additions, each individually reversible via `CHAD_DISABLE`.

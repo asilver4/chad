@@ -623,6 +623,58 @@ def test_done_audit(monkeypatch):
     assert not levers.enabled(n)
 
 
+# === iter-15 ================================================================
+
+def test_audit_churn_handoff(monkeypatch):
+    """The handoff's behavioral bite (an empty-diff done bounced once with the audit
+    steer before the no-empty-diff hard stop, gone when ablated) lives in
+    test_done_audit.py's e2e pair. Here assert the gate flips and the handoff entry
+    swaps the promise for the truthful conditional one — a false unconditional
+    promise on this path would spend the audit's anti-spiral credibility."""
+    n = bite("audit_churn_handoff")
+    on(monkeypatch)
+    assert levers.enabled(n)
+    steer = guardrails.done_audit(
+        "You must write the answer to /app/out.txt exactly.",
+        {"turn_start_epoch": 0.0, "wall_s": 0.0, "wall_budget_s": None,
+         "step_walls": []}, entry="handoff")
+    assert "cannot be accepted yet" in steer
+    assert "Then call done again; it will be accepted" not in steer
+    off(monkeypatch, n)
+    assert not levers.enabled(n)
+
+
+def test_bash_auto_background(monkeypatch, tmp_path):
+    """ON, a timed-out command is handed to the background with its output streaming
+    to a named file; OFF, its process group is killed and the result advises doing it
+    by hand. The fuller lifecycle pair (footer, caps, no orphans) is in test_tools.py."""
+    n = bite("bash_auto_background")
+    monkeypatch.setenv("CHAD_SPILL_DIR", str(tmp_path))
+    try:
+        on(monkeypatch)
+        assert levers.enabled(n)
+        res = tools.tool_bash("printf 'X\n'; sleep 5", timeout=1)
+        assert res.startswith("[still running after 1s"), res[:80]
+        off(monkeypatch, n)
+        killed = tools.tool_bash("printf 'X\n'; sleep 5", timeout=1)
+        assert killed.startswith("[timed out after 1s;"), killed[:80]
+        assert "background it" in killed
+    finally:
+        tools.bash_shutdown()
+
+
+def test_capped_think_credit(monkeypatch):
+    """The credit's behavioral bite (a turn of cap-truncated thinks engages the
+    throttle with it on and never with it off) lives in test_agent_e2e.py's
+    _run_capped_think pair — the accounting is inline in run_turn, so the loop is
+    the only place it is observable. Here assert the gate itself flips."""
+    n = bite("capped_think_credit")
+    on(monkeypatch)
+    assert levers.enabled(n)
+    off(monkeypatch, n)
+    assert not levers.enabled(n)
+
+
 # === turn-level think budget =====================================
 
 def test_turn_think_budget(monkeypatch):

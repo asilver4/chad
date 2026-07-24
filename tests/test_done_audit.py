@@ -503,3 +503,127 @@ def test_audit_rebounce_lever_off_keeps_the_unconditional_promise(tmp_path, monk
     first = next(c for c in tool_notes if "done-audit" in c)
     assert "without further audit" in first
     assert not any("final audit" in c for c in tool_notes)
+
+
+# --- Churn→audit handoff at the no-empty-diff hard stop -------------------------------
+
+def test_handoff_steer_promise_is_conditional():
+    """The handoff entry must not promise unconditional acceptance — on that path the
+    next done still has to clear the no-empty-diff gate, and a promise the harness
+    breaks spends the anti-spiral credibility the audit's contract depends on."""
+    steer = guardrails.done_audit(
+        "You must write the answer to /app/out.txt exactly.", _state(),
+        entry="handoff")
+    assert "cannot be accepted yet" in steer
+    assert "once a change is landed and verified" in steer
+    assert "one-time check before this `done` is accepted" not in steer
+    assert "Then call done again; it will be accepted" not in steer
+    # Default entry keeps the 101 wording byte-for-byte.
+    legacy = guardrails.done_audit(
+        "You must write the answer to /app/out.txt exactly.", _state())
+    assert "one-time check before this `done` is accepted" in legacy
+
+
+def test_handoff_bounces_an_empty_diff_done_then_hard_stops(tmp_path):
+    """The audit-silent churn class: an empty-diff done on a path-naming action task
+    gets ONE audit steer in context — with the absent-path fact — and the NEXT
+    empty-diff done hard-stops exactly as before (churn capped, not replaced)."""
+    f = tmp_path / "out.py"
+    script = [
+        _tool_call("bash", command="true"),          # real work, no landed edit
+        _tool_call("done", summary="all set"),       # handoff bounce, not hard stop
+        _tool_call("done", summary="really done"),   # empty-diff hard stop as before
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result.startswith("[stopped:")
+    assert agent.budget_note
+    audits = [m for m in agent.messages if "done-audit" in m.get("content", "")]
+    assert len(audits) == 1
+    assert "cannot be accepted yet" in audits[0]["content"]
+    assert f"{f}: mentioned in the task, currently absent" in audits[0]["content"]
+
+
+def test_handoff_then_landed_fix_is_accepted(tmp_path):
+    """The conversion the handoff exists for: the steer's requirements land in context
+    with the turn's work, the model applies + verifies the fix, and the next done
+    passes every gate (latch forecloses a second audit)."""
+    f = tmp_path / "out.py"
+    script = [
+        _tool_call("bash", command="true"),
+        _tool_call("done", summary="all set"),       # handoff bounce
+        _tool_call("write", path=str(f), content="print('hi')\n"),
+        _tool_call("bash", command=f"python {f}"),   # verify -> clears unverified
+        _tool_call("done", summary="fixed and verified"),
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result == "fixed and verified"
+    assert agent.engine._i == len(script)
+    audits = [m for m in agent.messages if "done-audit" in m.get("content", "")]
+    assert len(audits) == 1
+
+
+def test_handoff_bounces_a_prose_churn_ending_once(tmp_path):
+    """Prose-ending twin: after the answer nudges spend, the ending that used to be
+    the hard stop is bounced once by the audit; the following prose ending stops."""
+    f = tmp_path / "out.py"
+    script = [
+        _tool_call("bash", command="true"),
+        "The file is already correct.",   # answer nudge 1
+        "It is complete.",                # answer nudge 2
+        "Task complete.",                 # handoff bounce (was: hard stop)
+        "Confirmed complete.",            # hard stop, as before the lever
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result.startswith("[stopped:")
+    assert agent.engine._i == len(script)
+    audits = [m for m in agent.messages if "done-audit" in m.get("content", "")]
+    assert len(audits) == 1
+    assert "cannot be accepted yet" in audits[0]["content"]
+
+
+def test_handoff_lever_off_restores_the_immediate_hard_stop(tmp_path, monkeypatch):
+    """OFF arm (ablation): the first empty-diff done hard-stops with no bounce —
+    byte-identical to the pre-lever gate order."""
+    monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
+    f = tmp_path / "out.py"
+    script = [
+        _tool_call("bash", command="true"),
+        _tool_call("done", summary="all set"),   # immediate hard stop
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result.startswith("[stopped:")
+    assert not any("done-audit" in m.get("content", "") for m in agent.messages)
+
+
+def test_handoff_latch_is_shared_with_the_accept_path_audit(tmp_path):
+    """One audit per turn TOTAL: an accept-path bounce forecloses the handoff (and
+    vice versa) — a turn must never pay two audit steers."""
+    f = tmp_path / "out.py"
+    g = tmp_path / "helper.py"
+    script = [
+        _tool_call("write", path=str(g), content="print(1)\n"),
+        _tool_call("bash", command=f"python {g}"),
+        _tool_call("done", summary="first done"),    # accept-path audit bounce
+        _tool_call("write", path=str(f), content="print('hi')\n"),
+        _tool_call("bash", command=f"python {f}"),   # deliverable landed+verified
+        _tool_call("done", summary="second done"),   # latch: accepted, no handoff
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result == "second done"
+    tool_notes = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+    assert sum("done-audit" in c for c in tool_notes) == 1

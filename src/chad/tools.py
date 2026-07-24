@@ -6,6 +6,7 @@ deliberately conservative: reads are unrestricted, writes/bash are real but the 
 gates them behind a confirmation unless --yolo is set.
 """
 
+import atexit
 import fnmatch
 import glob as _glob
 import hashlib
@@ -66,7 +67,252 @@ def _kill_group(p):
         p.kill()  # group already gone, or no permission — fall back to the parent
 
 
+# --- Auto-background on timeout (lever: bash_auto_background) -----------------------
+# A command that outlives its timeout is killed, and everything it already did — an
+# apt-get, a compile, a model download — is thrown away; the model's only route back
+# is to re-run it and pay the same wall a second time. Backgrounding keeps the work
+# and hands the model the spill file as the interface: it already knows how to
+# read/grep a path, so nothing new has to be taught. Bounded deliberately (chad has
+# had one unbounded-resource incident): at most BASH_BG_MAX at a time, each with an
+# absolute lifetime, all SIGTERM'd at exit.
+BASH_BG_MAX = 2                    # concurrent backgrounded commands
+BASH_BG_CEILING_S = 30 * 60        # absolute lifetime of a backgrounded command
+_bg_lock = threading.Lock()
+_bg_live: list["_BgDrainer"] = []
+
+
+class _BgDrainer:
+    """Drains a command's merged output on a thread, with a mid-flight handoff.
+
+    Until `background()` is called the output accumulates in memory — the foreground
+    contract, where `partial()` is what a kill/interrupt result shows. After it, the
+    buffered text and everything that follows go to a spill file the model can read
+    while the command keeps running, and the process's exit code is appended as a
+    footer so completion is greppable without any polling API."""
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.path: str | None = None
+        self._lock = threading.Lock()
+        self._buf: list[str] = []
+        self._fh: io.TextIOBase | None = None
+        self._timer: threading.Timer | None = None
+        self._killed = False
+        self._done = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        # Line-at-a-time rather than communicate(): a backgrounded command has to keep
+        # streaming somewhere the model can see, which a single read-to-EOF cannot do.
+        try:
+            for line in iter(self.proc.stdout.readline, ""):
+                with self._lock:
+                    if self._fh is not None:
+                        try:
+                            self._fh.write(line)
+                            self._fh.flush()
+                        except OSError:
+                            pass
+                    else:
+                        self._buf.append(line)
+        except (OSError, ValueError):
+            pass
+        try:
+            self.proc.stdout.close()
+        except OSError:
+            pass
+        self.proc.wait()
+        self._close("[killed: background ceiling]" if self._killed
+                    else f"[exit {self.proc.returncode} at {time.strftime('%H:%M:%S')}]")
+
+    def _close(self, footer: str) -> None:
+        with self._lock:
+            self._done = True
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if self._fh is not None:
+                try:
+                    self._fh.write("\n" + footer + "\n")
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+            # Deregister under the SAME lock `background` registers under, so a command
+            # that finishes in the instant we decide to background it cannot leave a
+            # dead entry occupying a slot.
+            with _bg_lock:
+                if self in _bg_live:
+                    _bg_live.remove(self)
+
+    def partial(self) -> str:
+        with self._lock:
+            return "".join(self._buf)
+
+    def background(self, path: str) -> bool:
+        """Hand the drain off to `path`, flushing what is already buffered. False if the
+        command finished first (caller then has a normal result, not a timeout) or the
+        file could not be opened."""
+        with self._lock:
+            if self._done:
+                return False
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                fh = os.fdopen(fd, "w", errors="replace")
+                fh.write("".join(self._buf))
+                fh.flush()
+            except OSError:
+                return False
+            self._fh, self.path = fh, path
+            self._timer = threading.Timer(BASH_BG_CEILING_S, self._ceiling)
+            self._timer.daemon = True
+            self._timer.start()
+            with _bg_lock:
+                _bg_live.append(self)
+        return True
+
+    def _ceiling(self) -> None:
+        self._killed = True
+        _kill_group(self.proc)
+
+    def stop(self) -> None:
+        """SIGTERM the group, brief grace, then SIGKILL — session shutdown. The drainer
+        thread ends when the pipe closes, which is what joining it waits for."""
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        self.thread.join(2)
+        if self.thread.is_alive():
+            _kill_group(self.proc)
+            self.thread.join(1)
+
+
+def bash_shutdown() -> None:
+    """Stop every backgrounded command. Registered with atexit so a chad that exits —
+    cleanly or not — never leaves a build orphaned behind it."""
+    with _bg_lock:
+        live = list(_bg_live)
+    for d in live:
+        d.stop()
+
+
+atexit.register(bash_shutdown)
+
+_bg_signals_hooked = False
+
+
+def _hook_exit_signals() -> None:
+    """atexit alone is not enough: Python does NOT run atexit handlers when the process
+    is terminated by SIGTERM/SIGHUP — it dies on the spot — so a chad killed by a
+    supervisor, a harness timeout, or a closing terminal would leak whatever it had
+    backgrounded. (Measured, not assumed: the orphan drill leaked a `sleep 300` group
+    with only the atexit hook in place.) Installed lazily, the first time something is
+    actually backgrounded, and chained to whatever handler was already there, so a
+    default build's signal behavior is untouched."""
+    global _bg_signals_hooked
+    if _bg_signals_hooked or threading.current_thread() is not threading.main_thread():
+        return
+    _bg_signals_hooked = True
+
+    def _chain(prev: Any) -> Any:
+        def handler(signum: int, frame: Any) -> None:
+            bash_shutdown()
+            if callable(prev):
+                prev(signum, frame)
+                return
+            if prev == signal.SIG_IGN:
+                return
+            # Default disposition: restore it and re-raise, so the exit status is
+            # the normal death-by-signal a supervisor expects.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        return handler
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _chain(signal.getsignal(sig)))
+        except (ValueError, OSError, RuntimeError):
+            continue
+
+
+def _bg_spill_path() -> str | None:
+    """A fresh 0600-able path for a backgrounded command's live output. Named outside
+    the `bash-N.log` family on purpose: `_prune_spills` must never delete a file a
+    running command is still writing to. Bounded instead by the 7-day stale sweep."""
+    d = _spill_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"bgcmd-{next(_SPILL_IDS)}.log")
+    except OSError:
+        return None
+
+
+def _bash_backgrounded(d: "_BgDrainer", timeout: int) -> str | None:
+    """Move a timed-out command to the background and describe where its output went,
+    or None when that isn't possible (slots full, command already finished, no disk)
+    and the caller should kill it as before."""
+    with _bg_lock:
+        if len(_bg_live) >= BASH_BG_MAX:
+            return None
+    path = _bg_spill_path()
+    if not path or not d.background(path):
+        return None
+    _hook_exit_signals()
+    partial = d.partial()
+    try:
+        pgid = os.getpgid(d.proc.pid)
+    except OSError:
+        pgid = d.proc.pid
+    head = (f"[still running after {timeout}s — moved to the background (pgid {pgid}), "
+            f"NOT killed, so the work so far is not lost.\n"
+            f"Its output continues to stream to {path} — read or grep THAT file to "
+            f"check progress, and do other work meanwhile instead of waiting on it. "
+            f"The file ends with \"[exit <code> at HH:MM:SS]\" once the command "
+            f"finishes.\n"
+            f"Output so far ({len(partial)} chars):]")
+    partial = partial.strip()
+    return head + "\n" + _bash_headtail(partial) if partial else head
+
+
+def _bash_auto_background(command: str, timeout: int, should_stop) -> str:
+    """tool_bash's timeout path when auto-background is armed. Mirrors the foreground
+    loop exactly, except that a timeout hands the command off instead of killing it."""
+    try:
+        p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, errors="replace",
+                             start_new_session=True)
+    except OSError as e:
+        return f"[failed to launch: {e}]"
+    d = _BgDrainer(p)
+    deadline = time.time() + timeout
+    while d.thread.is_alive():
+        # A user interrupt still kills outright: the point of ^C is that the thing
+        # stops, so it must not quietly keep running in the background.
+        if should_stop and should_stop():
+            _kill_group(p); d.thread.join(2)
+            return _bash_killed("[interrupted by user", d.partial())
+        if time.time() > deadline:
+            note = _bash_backgrounded(d, timeout)
+            if note is not None:
+                return note
+            _kill_group(p); d.thread.join(2)
+            return _bash_killed(
+                f"[timed out after {timeout}s (already {BASH_BG_MAX} command(s) "
+                f"running in the background, so this one was killed)", d.partial())
+        d.thread.join(0.1)
+    out = d.partial().strip()
+    if p.returncode is None:
+        p.poll()
+    if p.returncode not in (0, None):
+        out = f"[exit {p.returncode}]\n{out}"
+    return _bash_headtail(out) if out else "[no output]"
+
+
 def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
+    if levers.enabled("bash_auto_background"):
+        return _bash_auto_background(command, timeout, should_stop)
     try:
         # errors="replace": text mode decodes strictly by default, so binary bytes in the
         # output (hexdump, `cat` on an archive) killed the reader thread mid-communicate —

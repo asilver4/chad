@@ -278,11 +278,14 @@ def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
     assert [m["name"] for m in agent.messages if m.get("role") == "tool"] == ["read"]
 
 
-def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path):
+def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path, monkeypatch):
     """Negative control (verify): if a dispatch genuinely fails, the loop
     must NOT silently 'succeed'. Pointing `write` at a path under a non-existent file (so
     the parent isn't a directory) makes the real tool raise; the loop feeds the error back
-    as the tool result rather than pretending the file was written."""
+    as the tool result rather than pretending the file was written. (The churn
+    handoff would rightly bounce the empty-diff done first — disabled here; this test
+    is about dispatch, and the handoff has its own coverage in test_done_audit.py.)"""
+    monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
     not_a_dir = tmp_path / "file.txt"
     not_a_dir.write_text("i am a file, not a directory\n")
     doomed = not_a_dir / "child.txt"     # parent is a file -> os.makedirs / open fails
@@ -398,11 +401,14 @@ def test_step_cap_stops_and_banks_note_without_progress(tmp_path):
 
 # --- Iter-2: no-empty-diff terminal gates --------------------------------
 
-def test_no_empty_diff_gate_blocks_prose_end_on_action_task():
+def test_no_empty_diff_gate_blocks_prose_end_on_action_task(monkeypatch):
     """An ACTION task whose model stalls into prose 'final answers' (the NIGHT-7 bail
     signature: django-14007/sphinx-9230 accepted a 'Let me search…' sentence as the
     final answer with an EMPTY diff and 97% of budget unused) must end as a resumable
-    hard stop with a progress note — never as a silent success."""
+    hard stop with a progress note — never as a silent success. (This test is about
+    the GATE; the churn handoff would insert one audit bounce first — its own
+    coverage lives in test_done_audit.py.)"""
+    monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
     script = [
         "Let me find where the bug is defined.",   # bail 1 -> nudge
         "Let me search for the relevant code.",    # bail 2 -> nudge (budget exhausted)
@@ -417,10 +423,13 @@ def test_no_empty_diff_gate_blocks_prose_end_on_action_task():
     assert agent.budget_note                # relaunch seed for --auto-continue
 
 
-def test_no_empty_diff_gate_blocks_done_with_unverified_edit(tmp_path):
+def test_no_empty_diff_gate_blocks_done_with_unverified_edit(tmp_path, monkeypatch):
     """`done` after the verify nudges are exhausted, with an edit in tree and no
     successful run since (matplotlib-25332 r3: done at 84s, zero post-edit commands
-    succeeded, no guard fired) becomes a resumable hard stop."""
+    succeeded, no guard fired) becomes a resumable hard stop. (Gate-focused: the
+    churn handoff — one audit bounce before this stop — is disabled here and
+    covered in test_done_audit.py.)"""
+    monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
     script = [
@@ -818,6 +827,53 @@ def test_turn_think_budget_inert_below_min_wall(monkeypatch):
                                    script=[stall] * 3, turn_budget_s=200)
     assert flags, "the turn should have taken at least one step"
     assert False not in flags, flags
+
+
+def _run_capped_think(monkeypatch, *, ablated: bool):
+    """Drive a turn whose every generation ends INSIDE <think> at the raw token cap:
+    no closing tag, and no stop CONDITION fired (the raw cap is not one). Faithful to
+    the real generation, which never emits the opening tag either — the chat template
+    opens the block, so the model's output is bare reasoning text. `max_gen_tokens`
+    matches what the engine reports so each step registers as a cap hit."""
+    if ablated:
+        monkeypatch.setenv("CHAD_DISABLE", "capped_think_credit")
+    else:
+        monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    truncated = "reasoning " * 50          # opened by the template, never closed
+    eng = _BigThinkEngine([truncated] * 6)
+    tok = _ThinkFlagTok()
+    eng.tok = tok
+    agent = Agent(eng, mode="auto", thinking=True, max_gen_tokens=15000,
+                  turn_budget_s=1e9)
+    agent.run_turn("change the config value")
+    return tok.flags
+
+
+def test_capped_think_is_credited_so_the_budget_engages(monkeypatch):
+    """A generation truncated mid-reasoning is the LARGEST kind there is (one full
+    token cap each). Credited, its cumulative spend crosses the budget and the
+    throttle engages exactly as it does for closed thinks."""
+    flags = _run_capped_think(monkeypatch, ablated=False)
+    assert flags[:2] == [True, True], flags          # thresholds cross on steps 0-1
+    assert flags[2:] and all(f is False for f in flags[2:]), flags
+
+
+def test_capped_think_uncredited_leaves_the_budget_blind(monkeypatch):
+    """OFF arm — the defect this lever closes: identical over-spending, but because
+    the generations never closed their think block the budget counts ZERO and the
+    throttle never engages, no matter how much reasoning the turn burns."""
+    flags = _run_capped_think(monkeypatch, ablated=True)
+    assert flags, "the turn should have taken at least one step"
+    assert False not in flags, flags
+
+
+def test_closed_think_accounting_is_unchanged_by_the_lever(monkeypatch):
+    """Negative control: the lever adds a branch BELOW the two existing ones, so a
+    turn whose thinks close normally throttles identically with it on or off."""
+    on = _run_turn_think_budget(monkeypatch, ablated=False)
+    monkeypatch.setenv("CHAD_DISABLE", "capped_think_credit")
+    off = _run_turn_think_budget(monkeypatch, ablated=False)
+    assert on == off, (on, off)
 
 
 def test_turn_think_budget_is_gone_when_ablated(monkeypatch):

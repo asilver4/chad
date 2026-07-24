@@ -1237,6 +1237,20 @@ class Agent:
             elif "</think>" in text and len(text):
                 frac = len(text.split("</think>", 1)[0]) / len(text)
                 _think_delta = int(stats.generated_tokens * frac)
+            elif (hit_cap and step_thinking and text
+                    and levers.enabled("capped_think_credit")):
+                # Same reasoning as the soft-stop branch, for the generation that ran
+                # to the RAW token cap while still inside <think>: no </think> was
+                # emitted, so every token is reasoning. Without this the biggest
+                # thinks in a run — a full cap each, and the ones the budget exists
+                # to bound — credit zero and the throttle never engages.
+                # close_unclosed_think above rests on the same premise: a thinking
+                # generation with no </think> never left the block. The predicate is
+                # the reasoning_length_stop telemetry's, minus the soft-stop overlap
+                # the first branch already credits; an unclosed generation that
+                # stopped SHORT of the cap is a truncation of some other kind, not
+                # the reasoning overspend this counts.
+                _think_delta = stats.generated_tokens
             else:
                 _think_delta = 0
             self.think_tokens += _think_delta
@@ -1485,6 +1499,40 @@ class Agent:
                 did_nothing = self.mode == "auto" and not read_only_intent and not did_work
                 if (action_task and not read_only_intent
                         and (not made_edit or unverified_edit)) or did_nothing:
+                    # Churn→audit handoff: this hard stop used to fire with the
+                    # audit still silent — the turn ends, a progress note carrying
+                    # the model's own completion claim gets banked, and each
+                    # relaunch re-dones into the same stop until the continue
+                    # allowance is exhausted. Hand the ending to the audit ONCE
+                    # instead: quoted requirements + path facts land IN CONTEXT
+                    # with the turn's work. A further empty-diff ending still
+                    # hard-stops exactly as below (churn capped, not replaced);
+                    # latch shared with the accept-path audit.
+                    if self.mode != "plan" and not self._subagent \
+                            and levers.enabled("done_audit") \
+                            and levers.enabled("audit_churn_handoff") \
+                            and not done_audit_fired:
+                        audit_task = guardrails.audit_task_text(user_text)
+                        audit = guardrails.done_audit(audit_task, {
+                            "turn_start_epoch": turn_start_epoch,
+                            "wall_s": time.monotonic() - turn_start,
+                            "wall_budget_s": self._turn_budget_s,
+                            "step_walls": step_walls,
+                        }, entry="handoff")
+                        if audit:
+                            done_audit_fired = True
+                            done_audit_bounces += 1
+                            audit_absent_list = guardrails.audit_absent_paths(audit_task)
+                            _runway = ((self._turn_budget_s
+                                        - (time.monotonic() - turn_start))
+                                       if self._turn_budget_s else float("inf"))
+                            log.info("DONE-AUDIT bounce (churn-handoff, "
+                                     "final-answer): paths=%s runway=%.0fs",
+                                     guardrails.audit_extract_paths(audit_task),
+                                     _runway)
+                            self.messages.append({"role": "tool", "name": "edit",
+                                                  "content": audit})
+                            continue
                     # Iter-2 no-empty-diff gate: an action task may not END on a prose
                     # "final answer" while no change landed (or the change is
                     # unverified) — the demonstrated failures (django-14007,
@@ -1606,6 +1654,34 @@ class Agent:
                     continue
                 if action_task and not read_only_intent and self.mode != "plan" \
                         and (not made_edit or unverified_edit):
+                    # Churn→audit handoff, done-tool twin (see the final-answer
+                    # site above): one audit bounce before the hard stop; the
+                    # next empty-diff done stops exactly as below.
+                    if not self._subagent \
+                            and levers.enabled("done_audit") \
+                            and levers.enabled("audit_churn_handoff") \
+                            and not done_audit_fired:
+                        audit_task = guardrails.audit_task_text(user_text)
+                        audit = guardrails.done_audit(audit_task, {
+                            "turn_start_epoch": turn_start_epoch,
+                            "wall_s": time.monotonic() - turn_start,
+                            "wall_budget_s": self._turn_budget_s,
+                            "step_walls": step_walls,
+                        }, entry="handoff")
+                        if audit:
+                            done_audit_fired = True
+                            done_audit_bounces += 1
+                            audit_absent_list = guardrails.audit_absent_paths(audit_task)
+                            _runway = ((self._turn_budget_s
+                                        - (time.monotonic() - turn_start))
+                                       if self._turn_budget_s else float("inf"))
+                            log.info("DONE-AUDIT bounce (churn-handoff): paths=%s "
+                                     "runway=%.0fs",
+                                     guardrails.audit_extract_paths(audit_task),
+                                     _runway)
+                            self.messages.append({"role": "tool", "name": "done",
+                                                  "content": audit})
+                            continue
                     # Same no-empty-diff gate as the prose-final-answer path: `done`
                     # with nothing landed (or landed-unverified after the verify
                     # nudges ran out) becomes a resumable hard stop, not a success

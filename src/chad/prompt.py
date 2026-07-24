@@ -258,7 +258,21 @@ def build_system_prompt(model_id: str | None = None) -> str:
     # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
     # below, where re-prefilling a few hundred tokens is cheap. The profile block is
     # static for a given model, so it sits above the boundary with the base prompt.
-    return _BASE_PROMPT + profiles.prompt_block(model_id) + "\n".join(_dynamic_context())
+    return (_BASE_PROMPT + _bash_bg_block() + profiles.prompt_block(model_id)
+            + "\n".join(_dynamic_context()))
+
+
+def _bash_bg_block() -> str:
+    """One line about auto-background, only while the lever is on — describing a
+    behavior the harness isn't exhibiting would teach the model to wait on files that
+    never appear. Static for the session, so it sits above the cache boundary."""
+    from . import levers
+    if not levers.enabled("bash_auto_background"):
+        return ""
+    return ("\n- A `bash` command that outruns its timeout is NOT killed: it keeps "
+            "running and its output streams to a file named in the result. Read or "
+            "grep that file to check on it, and do other work while it runs — never "
+            "sit in a loop re-reading it.\n")
 
 
 def build_subagent_prompt(model_id: str | None = None) -> str:

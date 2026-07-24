@@ -401,11 +401,20 @@ _AUDIT_REQ_RE = re.compile(
 # sparql-university's three numbered criteria).
 _AUDIT_LIST_ITEM_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+\S")
 
-DONE_AUDIT_DEMAND = (
+_DONE_AUDIT_DEMAND_BODY = (
     "Re-verify each requirement above against the ACTUAL files/system with fresh "
     "commands — do not rely on your memory of earlier checks, and check the task's "
     "exact wording (right path, right format, right behavior), not a weaker version "
-    "of it. Fix anything that fails. Then call done again; it will be accepted.")
+    "of it. Fix anything that fails. ")
+DONE_AUDIT_DEMAND = (_DONE_AUDIT_DEMAND_BODY
+                     + "Then call done again; it will be accepted.")
+# Churn-handoff variant: entered from the no-empty-diff hard stop, where
+# acceptance additionally requires a landed+verified change — promising
+# unconditional acceptance there would be false, and the promise's credibility
+# is what keeps a bounced model from spiraling instead of complying.
+DONE_AUDIT_DEMAND_HANDOFF = (
+    _DONE_AUDIT_DEMAND_BODY
+    + "Then apply the fix, verify it by running it with bash, and call done again.")
 
 
 def audit_task_text(user_text: str) -> str:
@@ -485,12 +494,17 @@ def audit_path_facts(paths, turn_start_epoch):
     return facts
 
 
-def done_audit(task_text, turn_state):
+def done_audit(task_text, turn_state, entry="accept"):
     """The one-shot done-audit steer, or None to accept the done untouched. Fires only
     with wall runway to spare — an audit that pushes the task into the wall converts a
     wrong-done into a wall-death (same score, worse autopsy) — and only when the task
     text yields something concrete to audit against. The caller owns the once-per-turn
     latch, the action-task/plan-mode scoping, and the message append.
+
+    entry: "accept" (a done every gate would otherwise accept) or "handoff" (a done
+    the no-empty-diff gate was about to hard-stop; the steer's framing and promise
+    change because acceptance there still requires a landed+verified change, and a
+    false promise burns the anti-spiral credibility).
 
     turn_state: turn_start_epoch (time.time() at turn start, for mtime facts), wall_s
     (elapsed), wall_budget_s (None when no budget is configured — runway then unlimited),
@@ -509,13 +523,26 @@ def done_audit(task_text, turn_state):
     # The acceptance promise must stay truthful: with the absent-path re-bounce
     # armed (levers.audit_absent_rebounce) one further existence-only check may run,
     # so say so; otherwise keep the original unconditional promise (the anti-spiral
-    # latch depends on the model believing it).
-    if levers.enabled("audit_absent_rebounce"):
-        promise = ("your NEXT `done` will be accepted after at most one further "
-                   "check that the paths below exist.")
+    # latch depends on the model believing it). On the handoff entry acceptance is
+    # additionally conditioned on a landed+verified change — say that instead.
+    rebounce = levers.enabled("audit_absent_rebounce")
+    if entry == "handoff":
+        lead = ("[done-audit — this `done` cannot be accepted yet: no change has "
+                "landed and been verified this turn; ")
+        promise = ("once a change is landed and verified, your next `done` will be "
+                   + ("accepted after at most one further check that the paths "
+                      "below exist." if rebounce
+                      else "accepted without further audit."))
+        demand = DONE_AUDIT_DEMAND_HANDOFF
     else:
-        promise = "your NEXT `done` will be accepted without further audit."
-    parts = ["[done-audit — one-time check before this `done` is accepted; " + promise
+        lead = "[done-audit — one-time check before this `done` is accepted; "
+        if rebounce:
+            promise = ("your NEXT `done` will be accepted after at most one further "
+                       "check that the paths below exist.")
+        else:
+            promise = "your NEXT `done` will be accepted without further audit."
+        demand = DONE_AUDIT_DEMAND
+    parts = [lead + promise
              + " The hidden grader checks "
              "the task's OWN requirements, not the checks you happened to run. From the "
              "task statement:"]
@@ -526,7 +553,7 @@ def done_audit(task_text, turn_state):
                      "evidence to weigh, not verdicts; a path the task removes may "
                      "rightly be absent):")
         parts += [f"  - {f}" for f in facts]
-    parts.append(DONE_AUDIT_DEMAND + "]")
+    parts.append(demand + "]")
     return "\n".join(parts)
 
 
