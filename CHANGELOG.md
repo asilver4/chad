@@ -2,6 +2,24 @@
 
 Notable, user-visible changes.
 
+## Unreleased
+
+- **`chad serve` — drive the local MLX model from a Linux container.** chad's remote arm
+  (`--backend llama`) exists because MLX can't run in a benchmark container, which in
+  practice meant measuring a *different quantization* of the model on a remote GPU box.
+  `chad serve` exposes the in-process MLX engine — real prefix cache and all — over the
+  same llama.cpp `/completion` protocol that arm already speaks, so the container drives
+  the model people actually run, unchanged and with exact server-side timings.
+  `--host`/`--port` (`CHAD_SERVE_HOST`/`CHAD_SERVE_PORT`), loopback and unauthenticated by
+  default; `CHAD_SERVE_API_KEY` guards a wider bind. One KV cache means one agent at a
+  time; concurrent clients queue.
+- **Cache quarantine and warm-prefix come back over the wire.** Against a stock llama.cpp
+  server these are unavoidable no-ops (its cache is opaque and its disk isn't ours). A
+  `chad serve` server advertises both in `/props` and the client feature-detects, so a
+  sub-agent no longer evicts the main transcript's prefix and the stable system+tools
+  prefix warm-starts from disk. Nothing changes against a real llama-server, and a failed
+  call degrades to the old no-op — these are latency, never correctness.
+
 ## [1.0.5] — 2026-07-24
 
 Completion and reasoning-budget accuracy, plus an opt-in for long-running commands.

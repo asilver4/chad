@@ -425,6 +425,16 @@ def main():
     ap.add_argument("--api-key-env", dest="api_key_env", default=None,
                     help="name of the env var holding the API key for a remote backend; the "
                          "key is read from that var, never passed on the command line.")
+    # `chad serve` only: expose this machine's MLX engine over the same llama.cpp
+    # /completion protocol the remote backend speaks, so a chad that can't run MLX
+    # (a Linux container) drives the local model instead of a remote GGUF.
+    ap.add_argument("--host", default=None,
+                    help="`chad serve` only: bind address (default 127.0.0.1; use "
+                         "0.0.0.0 to accept clients from containers or the LAN). "
+                         "Also CHAD_SERVE_HOST.")
+    ap.add_argument("--port", type=int, default=None,
+                    help="`chad serve` only: TCP port (default 8081). Also "
+                         "CHAD_SERVE_PORT.")
     ap.add_argument("--repl", action="store_true",
                     help="plain line REPL instead of the full-screen TUI")
     # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task.
@@ -468,6 +478,11 @@ def main():
     if task == "prove":
         from . import prove
         sys.exit(prove.run(args))
+    # `chad serve` — same literal-positional dispatch: serve the local MLX engine over
+    # the llama.cpp /completion protocol instead of running an agent loop.
+    if task == "serve":
+        from . import serve
+        sys.exit(serve.run(args))
     # Ornith; no draft, ever. RAM-aware default, local-dir-preferred, HF fallback.
     model_id, why = _pick_model()
 

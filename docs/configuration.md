@@ -270,6 +270,44 @@ uv run chad --backend llama --base-url http://<host>:8081   # or CHAD_LLAMA_BASE
 - **`--api-key-env NAME`** — the *name* of the env var holding the API key (read from that
   var, never passed on the command line). Omit for a local endpoint that needs no key.
 
+### Serving the local model to a container (`chad serve`)
+
+`--backend llama` exists because a Linux container can't run MLX. The usual answer is to
+point it at a llama.cpp server holding a GGUF — but then the thing being measured is a
+different quantization of the model than the one people actually run. `chad serve` closes
+that gap: it speaks the *same* `/completion` protocol, backed by the local MLX engine and
+its real prefix cache, so the container drives **this** machine's model unchanged.
+
+```bash
+uv run chad serve --host 0.0.0.0 --port 8081     # on the Mac holding the weights
+# then, from the container (or another host):
+chad "…" --backend llama --base-url http://host.docker.internal:8081
+```
+
+- **`--host`** / **`CHAD_SERVE_HOST`** — bind address. Defaults to `127.0.0.1`; a container
+  reaching in over `host.docker.internal`, or any other machine, needs `0.0.0.0`.
+- **`--port`** / **`CHAD_SERVE_PORT`** — TCP port (default `8081`).
+- **`CHAD_SERVE_API_KEY`** — require `Authorization: Bearer <key>`. There is no auth by
+  default, which is why the default bind is loopback; set this whenever you widen it, and
+  give the client `--api-key-env`.
+
+Two things it does that a stock llama.cpp server can't, because both ends are chad's — it
+advertises them in `/props` and the client feature-detects, so nothing changes when you
+point the same client at a real llama-server:
+
+- **cache quarantine** — a sub-agent's excursion is bracketed by a real engine
+  push/pop, so it no longer evicts the main transcript's prefix.
+- **warm prefix** — the on-disk KV warm-start of the stable system+tools prefix, which a
+  remote client can't do because the checkpoint lives on the server's disk.
+
+The engine holds **one** KV cache, so generation is serialized: one agent at a time.
+Concurrent clients queue rather than thrash the prefix (`/props` and `/health` stay
+lock-free so a monitor can poll during a long turn). Two caveats worth stating before you
+trust a number that comes out of this: scores are *not* comparable to a GGUF run (different
+quantization is the whole point of the exercise), and on a laptop the agent's own container
+workload competes with decode — on a wall-clock-timed benchmark, a task can fail on time
+rather than on capability. Pilot a handful of tasks before trusting a full sweep.
+
 ### Turn budgets & think-cap
 
 A runaway-turn **governor** ends a turn that burns a lot of prefill without landing and
