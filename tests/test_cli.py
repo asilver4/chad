@@ -299,3 +299,44 @@ if __name__ == "__main__":
     print(f"\n{PASS} passed, {FAIL} failed")
     # Note: the home-dir note tests need pytest's capsys fixture; run them via `pytest`.
     raise SystemExit(1 if FAIL else 0)
+
+
+# --- sampler env: one call, so the knobs cannot drift apart ---------------
+
+def test_apply_sampler_env_sets_all_three(monkeypatch):
+    """They used to be three inlined sibling blocks in main(), which is why `chad serve`
+    — building its own engine — silently ran without ANY of them. One function now, so a
+    caller cannot honor temp and forget min_p."""
+    class E:
+        temp = 0.0
+        min_p = 0.0
+        top_p = 0.0
+    monkeypatch.setenv("CHAD_TEMP", "0.7")
+    monkeypatch.setenv("CHAD_MIN_P", "0.05")
+    monkeypatch.setenv("CHAD_TOP_P", "0.95")
+    e = E()
+    cli.apply_sampler_env(e)
+    assert (e.temp, e.min_p, e.top_p) == (0.7, 0.05, 0.95)
+
+
+def test_apply_sampler_env_ignores_junk_and_leaves_unset_knobs_alone(monkeypatch):
+    class E:
+        temp = 0.3
+        min_p = 0.02
+        top_p = 0.9
+    monkeypatch.setenv("CHAD_TEMP", "hot")
+    monkeypatch.delenv("CHAD_MIN_P", raising=False)
+    monkeypatch.delenv("CHAD_TOP_P", raising=False)
+    e = E()
+    cli.apply_sampler_env(e)
+    assert (e.temp, e.min_p, e.top_p) == (0.3, 0.02, 0.9)
+
+
+def test_serve_applies_the_same_sampler_env_as_the_local_cli():
+    """The point of `chad serve` is that a container measures the model people actually
+    run. A server that ignored CHAD_MIN_P would sample differently from a local chad
+    started with it — the exact drift this server exists to eliminate."""
+    import inspect
+
+    from chad import serve
+    assert "apply_sampler_env" in inspect.getsource(serve.run)

@@ -291,6 +291,28 @@ chad "…" --backend llama --base-url http://host.docker.internal:8081
   default, which is why the default bind is loopback; set this whenever you widen it, and
   give the client `--api-key-env`.
 
+The engine knobs are the same ones a local `chad` reads, and they mean the same thing
+here — the server is the local product, so `CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`,
+`CHAD_KV_CACHE_MAX_GB`, `CHAD_TEMP`, `CHAD_MIN_P` and `CHAD_TOP_P` all apply to the model
+it serves. A knob a request doesn't mention keeps the server's value; a request that sends
+one explicitly wins for that request only, so a client can A/B a sampler setting against a
+server without restarting it.
+
+`GET /props` reports the context window the server actually enforces, and clients should
+budget against it. That number is pinned at load and never moves, because clients read it
+once and size everything else against it. A prompt that doesn't fit is refused with `400`
+before anything is prefilled, and a `n_predict` larger than the room left beside the
+prompt is clamped to fit — overrunning the window is a Metal allocation the engine may not
+survive, and one client's bad budget shouldn't take down everyone else's session.
+
+The wall requests are admitted against is **live**, and can be tighter than the advertised
+window. The Metal budget is blind to other processes, so a container stack or a browser
+started after the server took physical pages the KV cache needs one-for-one; a prompt that
+fit at load may not fit now. `GET /health` reports both — `n_ctx` (advertised) and
+`safe_ctx` (what fits right now), plus `ctx_pressure` when they diverge — so you can see a
+tightened wall coming instead of meeting it as a `400`. `CHAD_CTX_RESERVE_GB` tunes the
+scratch headroom the estimate holds back (default 1.5).
+
 Two things it does that a stock llama.cpp server can't, because both ends are chad's — it
 advertises them in `/props` and the client feature-detects, so nothing changes when you
 point the same client at a real llama-server:

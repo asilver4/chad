@@ -19,6 +19,51 @@ Notable, user-visible changes.
   sub-agent no longer evicts the main transcript's prefix and the stable system+tools
   prefix warm-starts from disk. Nothing changes against a real llama-server, and a failed
   call degrades to the old no-op — these are latency, never correctness.
+- **A client that stops reading can no longer take the server down.** Streaming wrote
+  each token to the socket from the one thread allowed to touch MLX, with no timeout on
+  it — so a client that stopped draining without disconnecting (a suspended container, a
+  slept laptop) blocked that thread indefinitely and no other request could be served,
+  while `/health` still answered `ok`. A blocked write never raises, so the hung-up-client
+  cancel couldn't fire either. Generation now hands SSE lines to the request's own thread
+  through a bounded queue: the engine runs ahead of a slow reader instead of being paced
+  by it, and a peer that stops reading is written off the same way a disconnected one is.
+- **A request no longer silently zeroes the server's sampler config.** `min_p`, `top_p`
+  and `temperature` absent from a `/completion` body were defaulted to 0.0 and applied
+  anyway, wiping a server started with `CHAD_MIN_P`/`CHAD_TOP_P` on essentially every
+  request (the client only sends those knobs when they're armed) and forcing greedy
+  decoding. Absent now means "leave it alone"; an explicit `0.0` still disarms a knob for
+  that request only.
+- **Generated token ids on the wire are the engine's own.** They were recovered by
+  slicing the engine's cache past the prompt, which only holds on the main decode path —
+  the prompt-lookup path came up one token short every turn, and after a Metal OOM the
+  client was told a prefix was resident when the cache had been dropped. The engine now
+  reports what it generated, and says so when it reset the cache, so the client's mirror
+  and its prefill estimates stay honest on every path.
+- **Long turns stopped paying quadratic CPU to watch for stop markers.** The remote
+  backend re-scanned the entire generated text after every token; at 16k tokens that was
+  846ms of pure scanning on the thread draining the stream. Now incremental: 4.5ms.
+- **A long cold prefill no longer kills the turn it is working on.** The stream stayed
+  byte-silent from the response headers until the first token, and HTTP clients measure a
+  stall in bytes, not in your progress — chad's own passes its timeout to `urlopen`, which
+  applies it per read. A big prefill therefore timed out just before the first token, and
+  because a socket timeout looks transient the agent re-issued the step and paid for the
+  same prefill again. The stream now sends an SSE comment during silence; stock clients
+  discard it, so nothing on the wire changes for llama.cpp.
+- **A prompt that cannot fit is a 400, not a Metal OOM.** Nothing compared the prompt
+  against the context window before prefilling it, and `n_predict` was never clamped to
+  the room left beside the prompt — so a client that mis-budgeted (a stale pinned context,
+  a plain `curl`) walked the engine into an allocation it might not survive, taking every
+  other client with it. `/completion` and `/warm` now refuse an oversized prompt up front
+  and clamp the generation budget to what the window can hold. The admission wall is
+  **live**, not the number pinned at load: the Metal budget is blind to other processes,
+  so a docker stack or a second model started afterwards takes physical pages the KV cache
+  needs 1:1, and a prompt that fit an hour ago no longer does. `/props` keeps advertising
+  the stable window clients budget against; `/health` reports `safe_ctx` and
+  `ctx_pressure` so a tightened wall is visible before a request bounces off it.
+- **`chad serve` honors `CHAD_TEMP` / `CHAD_MIN_P` / `CHAD_TOP_P`.** It built its own
+  engine and read none of them, so a server started with a sampler config sampled as if
+  it had none — the one drift the server exists to eliminate. The three now travel as a
+  single shared call the CLI and the server both make, so they cannot drift apart again.
 
 ## [1.0.5] — 2026-07-24
 

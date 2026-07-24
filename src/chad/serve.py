@@ -59,6 +59,33 @@ the process. Two independent reasons, and the second is not optional:
 Read-only endpoints (`/props`, `/health`) touch no MLX and never enter the executor, so a
 monitor can poll while a long turn decodes.
 
+…AND THE ENGINE THREAD NEVER TOUCHES A SOCKET
+----------------------------------------------
+The one thread that decodes must not also be the thread that writes the wire, or TCP
+backpressure becomes MLX backpressure: a socket send blocks when the peer stops draining,
+and a blocked send on the engine thread stalls decoding for every client, not just the
+slow one. Worse, a *blocked* write never raises, so the hung-up-client cancel below can
+never fire — a client that stops reading without closing (a suspended container, a slept
+laptop) wedges the server until TCP keepalive notices, hours later, while `/health`
+happily reports `ok`.
+
+So generation pushes SSE lines onto a bounded queue and the request's own HTTP thread
+drains it and does the blocking write:
+
+    engine thread                    queue                    HTTP thread
+    ─────────────                    ─────                    ───────────
+    decode token ──► enqueue(line) ──► [ ][ ][ ] ──► get() ──► wfile.write()
+         ▲                │                                        │
+         │                │ Full after WRITE_STALL_S               │ raises on a
+         │                ▼                                        │ dead/stalled peer
+         └──── cancel ◄── gone.is_set() ◄──────────────────────────┘
+
+Both failure signals converge on the SAME path the dead-socket cancel already used: a
+`write` that raises. The drain thread turns a socket error into one; a peer that stops
+reading long enough to fill the queue turns a `put` timeout into one. `Engine.generate`
+stops on the next token either way, and the socket timeout on the handler bounds the
+drain itself so no thread blocks forever.
+
 WHAT IS STILL NOT THE LOCAL PRODUCT
 -----------------------------------
 Generated token ids ride in the final SSE line rather than per-chunk (the engine's
@@ -69,8 +96,10 @@ conservative — the server's own diff, and the stats it reports, stay exact.
 
 import json
 import os
+import queue
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
@@ -86,6 +115,35 @@ CAPABILITIES = [CAP_CACHE_QUARANTINE, CAP_WARM_PREFIX]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8081
 MAX_BODY_BYTES = 64 * 1024 * 1024   # a 128k-token id array is ~1 MB; this is slack
+
+# Streaming backpressure budget (see "…AND THE ENGINE THREAD NEVER TOUCHES A SOCKET").
+# The queue absorbs a client that reads in bursts; the timeout is how long a client may
+# stop draining before we call it dead and stop burning GPU on it. Generous on both
+# axes: a legitimate client that pauses to run a tool must not be cancelled, and 512
+# lines is well under a megabyte.
+STREAM_QUEUE_MAX = 512
+WRITE_STALL_S = 60.0
+# How long the stream may stay byte-silent before we send an SSE comment to hold the
+# client's idle-read timeout off. A long cold prefill emits no tokens for minutes, and
+# clients time out on bytes, not on our progress. Comfortably under the tightest default
+# a real client ships with (chad's own is 600s; Node's undici is 300s).
+KEEPALIVE_S = 10.0
+
+# Admission wall (see ServerState.safe_ctx). The TTL keeps a burst of requests from each
+# paying for a ~3 ms memory probe; pressure does not move meaningfully faster than this.
+# The floor is the point past which tightening stops being a safety measure and becomes
+# an outage — under real pressure a short turn should still be servable.
+SAFE_CTX_TTL_S = 1.0
+SAFE_CTX_FLOOR = 4096
+# Bounds every socket operation on a connection, so the drain thread cannot block
+# forever on a peer that has stopped reading. Long generations are unaffected: while
+# there is nothing to send the drain thread waits on the QUEUE, not the socket.
+SOCKET_TIMEOUT_S = 300.0
+
+# A failed hand-off IS the cancel signal, whichever half failed: the socket rejected the
+# bytes (peer gone) or the queue stayed full past WRITE_STALL_S (peer not reading).
+# `queue.Full` is not an OSError, so it has to be named explicitly.
+WRITE_FAILED = (BrokenPipeError, ConnectionResetError, OSError, queue.Full)
 
 
 # --- pure helpers (no engine, no socket — unit-tested offline) --------------
@@ -136,7 +194,7 @@ def parse_completion_request(body: dict, tok: Any = None) -> dict:
     if not prompt_ids:
         raise ValueError("prompt is empty")
 
-    def _num(name: str, default: float) -> float:
+    def _num(name: str, default: Optional[float]) -> Optional[float]:
         v = body.get(name, default)
         if v is None:
             return default
@@ -144,19 +202,74 @@ def parse_completion_request(body: dict, tok: Any = None) -> dict:
             raise ValueError(f"{name} must be a number")
         return float(v)
 
-    n_predict = int(_num("n_predict", 512))
+    n_predict = int(_num("n_predict", 512) or 512)
     if n_predict <= 0:                      # llama.cpp's -1 means "until context end"
         n_predict = 512
     return {
         "prompt_ids": prompt_ids,
         "n_predict": n_predict,
-        "temperature": _num("temperature", 0.0),
-        # 0 = OFF, chad's convention across every sampler knob: an unset knob leaves
-        # whatever the engine was configured with rather than forcing a neutral value.
-        "min_p": _num("min_p", 0.0),
-        "top_p": _num("top_p", 0.0),
+        # Sampler knobs are None when ABSENT, which is not the same as 0.0. chad's
+        # convention is 0 = OFF, so a client that means "disable min_p" says 0.0 and a
+        # client that means "whatever the server is configured with" says nothing at all
+        # — and `build_completion_body` only sends min_p/top_p when they are armed, so
+        # "nothing at all" is the common case. Defaulting these to 0.0 here would ZERO a
+        # server started with CHAD_MIN_P on every single request, which is the opposite
+        # of leaving it alone (see stream_completion, which applies only what arrived).
+        "temperature": _num("temperature", None),
+        "min_p": _num("min_p", None),
+        "top_p": _num("top_p", None),
         "cache_prompt": bool(body.get("cache_prompt", True)),
     }
+
+
+def admit(prompt_len: int, n_predict: int, n_ctx: int,
+          safe_ctx: Optional[int] = None) -> tuple[int, Optional[str]]:
+    """Fit a request inside the context wall BEFORE anything is prefilled.
+
+    Returns `(n_predict, error)`. A non-None error means refuse the request outright.
+
+    TWO WALLS, and they are deliberately different numbers. `n_ctx` is what `/props`
+    advertises: pinned at load, never moving, because clients read it ONCE and budget
+    against it forever — a window that drifts with system load silently corrupts every
+    budget derived from it. `safe_ctx` is what actually fits in GPU memory RIGHT NOW,
+    and it must be live, because the Metal budget is blind to other processes: a docker
+    stack or a second model started after us takes physical pages, and the KV cache grows
+    into physical pages 1:1. Advertise the stable number, admit against the live one.
+
+    This is admission control, not politeness. The KV cache has to hold prompt +
+    generation, and a prompt that overruns it does not fail cleanly: it walks into a Metal
+    allocation the engine may not be able to recover from, and an OOM raised on a Metal
+    completion handler can take the process with it. A 400 costs the caller one request;
+    an OOM costs every client the server has, plus whatever the running turn was worth.
+
+    The client normally makes this unreachable — it reads `n_ctx` from /props and budgets
+    against it — which is exactly why the check belongs here too: the guard exists for the
+    caller that DIDN'T (a stale pin, a plain `curl`, a non-chad client, an off-by-a-turn
+    budget), and those are the ones that would otherwise take the box down.
+
+        0                        prompt_len              n_ctx
+        ├───────── prompt ──────────┤─── room ─────────────┤
+                                    └─ n_predict clamped to fit
+
+    `n_ctx <= 0` means the engine hasn't reported a window yet; invent no wall rather than
+    reject everything against a made-up number."""
+    if n_ctx <= 0:
+        return n_predict, None
+    wall = n_ctx if not safe_ctx else min(n_ctx, safe_ctx)
+    if prompt_len >= wall:
+        if prompt_len < n_ctx:
+            # Fits the advertised window but not today's memory. Say which, because the
+            # two have different remedies: this one clears up on its own.
+            return 0, (f"prompt is {prompt_len} tokens and this server advertises a "
+                       f"{n_ctx}-token window, but only {wall} tokens fit in GPU memory "
+                       f"right now — another process is holding it. Retry when memory "
+                       f"frees, or send a shorter prompt.")
+        return 0, (f"prompt is {prompt_len} tokens but this server's context window is "
+                   f"{n_ctx}; send a shorter prompt (GET /props reports the window "
+                   f"clients should budget against)")
+    # llama.cpp semantics: generation simply stops when the context ends, so silently
+    # fitting the budget is the expected behavior, not a refusal.
+    return min(n_predict, wall - prompt_len), None
 
 
 def timings_payload(stats: Any) -> dict:
@@ -193,7 +306,7 @@ def stream_completion(eng: Any, params: dict, write: Callable[[str], None]) -> d
             return
         try:
             write(sse(payload))
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except WRITE_FAILED:
             gone.set()
 
     def on_token(seg: str) -> None:
@@ -207,12 +320,19 @@ def stream_completion(eng: Any, params: dict, write: Callable[[str], None]) -> d
         # arm that wants every prompt to prefill from scratch.
         eng.reset()
 
-    # Per-request sampler knobs, restored afterwards so one request can't silently
-    # re-tune the next. Held under the caller's lock (see _Handler), so no interleave.
-    saved = (getattr(eng, "temp", 0.0), getattr(eng, "min_p", 0.0),
-             getattr(eng, "top_p", 0.0))
-    eng.temp, eng.min_p, eng.top_p = (params["temperature"], params["min_p"],
-                                      params["top_p"])
+    # Per-request sampler knobs: apply ONLY what the request actually carried, and
+    # restore afterwards so one request can't silently re-tune the next. A knob the
+    # request omitted is left exactly as the operator configured it — writing a neutral
+    # 0.0 over it would disarm CHAD_MIN_P/CHAD_TOP_P on every request, and forcing
+    # temperature to 0.0 would additionally decide the engine's decode strategy for it
+    # (`Engine.generate` gates the prompt-lookup path on temp == 0.0). Runs on the engine
+    # thread, one request at a time, so there is no interleave.
+    knobs = (("temp", "temperature"), ("min_p", "min_p"), ("top_p", "top_p"))
+    saved = {attr: getattr(eng, attr, 0.0) for attr, _ in knobs}
+    for attr, key in knobs:
+        v = params.get(key)
+        if v is not None:
+            setattr(eng, attr, v)
     try:
         text, stats = eng.generate(
             prompt_ids,
@@ -221,24 +341,32 @@ def stream_completion(eng: Any, params: dict, write: Callable[[str], None]) -> d
             should_stop=gone.is_set,
         )
     finally:
-        eng.temp, eng.min_p, eng.top_p = saved
+        for attr, _ in knobs:
+            setattr(eng, attr, saved[attr])
 
     if gone.is_set():
         # Client hung up: no final chunk to deliver it to. The engine's own cache is
         # intact and correct; only the client's mirror of it goes stale.
         return {"cancelled": True, "generated": 0}
 
-    # The generated ids, recovered from the engine's own cache bookkeeping
-    # (`_cached_ids` is prompt + generation after a turn) — this is what lets the
-    # client mirror the server's cache state and keep its prefill estimate honest.
-    cached_ids = list(getattr(eng, "_cached_ids", []) or [])
-    gen_ids = cached_ids[len(prompt_ids):] if len(cached_ids) >= len(prompt_ids) else []
-    emit({
+    # The generated ids, reported by the engine itself. This used to be recovered by
+    # slicing `eng._cached_ids` past the prompt, which is only `prompt + generation` on
+    # the main decode path: the prompt-lookup path stores what it FED the cache (short by
+    # the final pending token) and a Metal OOM empties it outright, so the slice was
+    # quietly wrong on two of three paths. `GenStats.gen_ids` is exact on all of them.
+    #
+    # `cache_reset` is the case ids alone cannot express: after an OOM the server's cache
+    # is EMPTY, so a client that mirrored `prompt + generation` would believe a prefix is
+    # resident that isn't. It tells the client to drop its mirror instead of guessing.
+    final = {
         "content": "",
         "stop": True,
-        "tokens": gen_ids,
+        "tokens": list(getattr(stats, "gen_ids", None) or []),
         "timings": timings_payload(stats),
-    })
+    }
+    if getattr(stats, "cache_reset", False):
+        final["cache_reset"] = True
+    emit(final)
     emit_done(write, gone)
     return {"cancelled": False, "generated": int(getattr(stats, "generated_tokens", 0)),
             "prefilled": int(getattr(stats, "prompt_tokens", 0)),
@@ -269,22 +397,82 @@ class ServerState:
         self.api_key = api_key
         self.quiet = quiet
         self.busy = False
+        self._safe_ctx_cache: tuple = (0.0, 0)   # (measured_at, tokens); see safe_ctx()
         # One worker: serializes access to the single KV cache AND keeps every MLX call
         # on one thread, which the thread-local GPU streams require (see module docstring).
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chad-engine")
 
+    def submit(self, fn: Callable, *args: Any, **kw: Any) -> Any:
+        """Queue `fn` for the engine thread and return its Future WITHOUT waiting. The
+        streaming path needs this: its caller has to stay free to drain the SSE queue
+        while the engine fills it (see `_Handler._completion`)."""
+        return self._pool.submit(fn, *args, **kw)
+
     def call(self, fn: Callable, *args: Any, **kw: Any) -> Any:
         """Run `fn` on the engine thread and wait for it. Exceptions propagate to the
         caller unchanged, so a handler still answers with a real error."""
-        return self._pool.submit(fn, *args, **kw).result()
+        return self.submit(fn, *args, **kw).result()
 
     def close(self) -> None:
         self._pool.shutdown(wait=False)
 
     def n_ctx(self) -> int:
-        # Reads a plain int off the engine object — no MLX, so no executor hop, so
+        # The ADVERTISED window: pinned at load, never moving. Clients read it once and
+        # budget against it for the life of the process, so it must not drift with system
+        # load. Reads a plain int off the engine object — no MLX, so no executor hop, so
         # /props and /health answer during a long generation.
         return int(getattr(self.eng, "effective_ctx", 0) or 0)
+
+    def safe_ctx(self) -> int:
+        """How many tokens actually fit in GPU memory right now — the admission wall.
+
+        The pinned window was computed against the memory this machine had at load. That
+        is the wrong number to admit against later: the Metal budget is blind to other
+        processes, so a docker stack or a browser started afterwards takes physical pages
+        the KV cache needs 1:1, and the prompt that fit an hour ago now walks into an
+        allocation failure the engine may not survive. Recomputed from LIVE memory, which
+        is the whole point — a pinned safety check is not a safety check.
+
+        Reuses `cli.ram_aware_ctx_limit`, the same measured math the local CLI sizes its
+        compaction trigger with (measured per-token KV cost, Metal recommendation, and the
+        host's own reclaimable band, since jetsam kills on physical pressure rather than
+        Metal accounting). Its `floor`/`gen_margin` defaults are compaction policy, not
+        admission policy, so they are passed explicitly here: never admit more than the
+        pinned window, and never tighten below `SAFE_CTX_FLOOR` — a server that refuses
+        everything under pressure is just a different outage.
+
+        Cached briefly: ~3 ms per probe is fine per request but wasteful in a burst, and
+        memory pressure does not move meaningfully inside a second. Never raises — if the
+        probe is unavailable (no MLX, engine not loaded) the pinned window stands, which
+        is exactly the behavior before this existed."""
+        pinned = self.n_ctx()
+        now = time.monotonic()
+        cached_at, cached = self._safe_ctx_cache
+        if now - cached_at < SAFE_CTX_TTL_S and cached:
+            return min(pinned, cached)
+        try:
+            import mlx.core as mx
+
+            from . import cli
+            kv_per_token = float(getattr(self.eng, "kv_bytes_per_token", 0.0) or 0.0)
+            # Subtract the resident KV so the floor measured mid-session is the same
+            # model floor measured at startup — otherwise the wall would shrink as the
+            # cache fills, which is the cache doing its job, not memory pressure.
+            active_floor = (mx.get_active_memory()
+                            - kv_per_token * len(getattr(self.eng, "_cached_ids", ()) or ()))
+            live = cli.ram_aware_ctx_limit(
+                pinned, mx.device_info()["max_recommended_working_set_size"],
+                active_floor, kv_per_token,
+                reserve_gb=cli._env_float("CHAD_CTX_RESERVE_GB") or 1.5,
+                host_avail_bytes=cli._host_avail_bytes(),
+                slope_factor=cli._env_float("CHAD_CTX_SLOPE_FACTOR") or 1.75,
+                floor=SAFE_CTX_FLOOR, gen_margin=0)
+        except Exception:  # noqa: BLE001 — a guard that can crash is worse than no guard
+            live = None
+        if not live:
+            return pinned
+        self._safe_ctx_cache = (now, int(live))
+        return min(pinned, int(live))
 
     def spill_status(self) -> dict:
         """Whether the engine can reclaim a quarantined cache to disk under memory
@@ -306,6 +494,16 @@ def _make_handler(state: ServerState) -> type:
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "chad-serve"
+        # Bounds every socket operation, so a peer that stops reading can never park a
+        # thread forever. Without it `timeout` is None and a blocked send simply waits —
+        # which is how a single suspended client used to take the whole server down.
+        timeout = SOCKET_TIMEOUT_S
+        # One SSE line per token is ~30 bytes: the exact small-write workload Nagle was
+        # built to coalesce, and exactly where that coalescing shows up as token latency
+        # against a client on the far side of a real link. Nothing to batch here, so
+        # don't. (Measured no difference on loopback, where ACKs are instant and Nagle
+        # never engages; this is for the container/LAN case the module docstring is about.)
+        disable_nagle_algorithm = True
 
         # -- plumbing --------------------------------------------------------
 
@@ -338,6 +536,21 @@ def _make_handler(state: ServerState) -> type:
         def _error(self, code: int, msg: str) -> None:
             self._send_json(code, {"error": {"code": code, "message": msg}})
 
+        def _emit_raw(self, text: str, dead: threading.Event) -> None:
+            """Write one already-encoded SSE payload to the socket, marking the peer dead
+            if it refuses. The single place this thread touches the wire — a token line
+            and a keepalive fail the same way and must be handled the same way."""
+            if dead.is_set():
+                return
+            try:
+                self.wfile.write(text.encode("utf-8"))
+                self.wfile.flush()
+            except (OSError, ValueError):
+                # Includes socket.timeout via SOCKET_TIMEOUT_S: a peer that stopped
+                # reading is indistinguishable from one that hung up, and both deserve
+                # the same answer — stop decoding for it.
+                dead.set()
+
         # -- routes ----------------------------------------------------------
 
         def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's spelling
@@ -349,8 +562,15 @@ def _make_handler(state: ServerState) -> type:
                 # behind a multi-minute generation.
                 return self._send_json(200, props_payload(state.n_ctx(), state.model_id))
             if path in ("/health", "/"):
+                # `n_ctx` is what clients budget against; `safe_ctx` is what memory
+                # allows right now. They are equal on an idle machine and diverge under
+                # pressure — which is invisible from the client side, so report it here
+                # rather than leaving a 400 to be the first anyone hears of it.
+                safe = state.safe_ctx()
                 return self._send_json(200, {"status": "ok", "busy": state.busy,
                                              "n_ctx": state.n_ctx(),
+                                             "safe_ctx": safe,
+                                             "ctx_pressure": safe < state.n_ctx(),
                                              "model": state.model_id,
                                              "spill": state.spill_status()})
             return self._error(404, f"no such endpoint: {path}")
@@ -381,6 +601,14 @@ def _make_handler(state: ServerState) -> type:
                 params = parse_completion_request(body, tok=getattr(state.eng, "tok", None))
             except ValueError as e:
                 return self._error(400, str(e))
+            # Refuse what cannot fit BEFORE the response starts: once the stream is open
+            # the status code is spent, and the only way left to report a failure is to
+            # hang up mid-generation.
+            params["n_predict"], too_big = admit(len(params["prompt_ids"]),
+                                                 params["n_predict"], state.n_ctx(),
+                                                 state.safe_ctx())
+            if too_big:
+                return self._error(400, too_big)
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -391,18 +619,68 @@ def _make_handler(state: ServerState) -> type:
             self.end_headers()
             self.close_connection = True
 
-            def write(chunk: str) -> None:
-                self.wfile.write(chunk.encode("utf-8"))
-                self.wfile.flush()
+            # Generation runs on the engine thread (one KV cache → one generation, and
+            # MLX's thread-local streams only exist there); THIS thread owns the socket.
+            # The queue is the seam. See the module docstring for why the two must not be
+            # the same thread.
+            lines: queue.Queue = queue.Queue(maxsize=STREAM_QUEUE_MAX)
+            done = object()             # sentinel: generation finished, drain what's left
+            dead = threading.Event()    # set by this thread when the socket refuses bytes
 
-            # Onto the engine thread: one KV cache → one generation (a queued request
-            # waits here rather than racing the prefix the running one is decoding
-            # against), and MLX's thread-local streams only exist on that thread. The
-            # SSE `write` closure runs there too — only one thread ever writes this
-            # socket, which is what makes the hung-up-client cancel safe.
+            def enqueue(chunk: str) -> None:
+                """`stream_completion`'s only I/O. Raising is the documented cancel
+                signal, and both ways this can fail mean the same thing: nobody is
+                reading. Never blocks longer than WRITE_STALL_S."""
+                if dead.is_set():
+                    raise BrokenPipeError("client hung up")
+                lines.put(chunk, timeout=WRITE_STALL_S)      # queue.Full → cancel
+
+            def generate() -> dict:
+                try:
+                    return stream_completion(state.eng, params, enqueue)
+                finally:
+                    try:
+                        lines.put_nowait(done)
+                    except queue.Full:
+                        # Never wait here. A full queue at this point means the drain is
+                        # still stuck on a client that stopped reading — the exact case
+                        # that just cancelled us — and blocking would make the engine
+                        # thread serve out a SECOND stall timeout before coming free.
+                        # The drain's future-done check retires it instead.
+                        pass
+
             state.busy = True
+            fut = state.submit(generate)
+            last_sent = time.monotonic()
             try:
-                info = state.call(stream_completion, state.eng, params, write)
+                while True:
+                    try:
+                        chunk = lines.get(timeout=0.5)
+                    except queue.Empty:
+                        if fut.done():
+                            break
+                        # Silence. A cold prefill of a long prompt produces no tokens for
+                        # minutes, and a client measures the wait on BYTES, not on our
+                        # progress: every HTTP client has an idle-read timeout, chad's own
+                        # included (CompletionEngine passes `timeout` to urlopen, which
+                        # applies it per read). Staying quiet through a long prefill gets
+                        # the turn killed just before the first token, and because a socket
+                        # timeout looks transient the agent re-issues the step — paying for
+                        # the same prefill again, and again. So keep the socket warm.
+                        if (not dead.is_set()
+                                and time.monotonic() - last_sent >= KEEPALIVE_S):
+                            last_sent = time.monotonic()
+                            self._emit_raw(": keepalive\n\n", dead)
+                        continue
+                    if chunk is done:
+                        break
+                    if dead.is_set():
+                        # Socket is gone; keep draining anyway so the engine never blocks
+                        # on a full queue while it winds down.
+                        continue
+                    last_sent = time.monotonic()
+                    self._emit_raw(chunk, dead)
+                info = fut.result()
             finally:
                 state.busy = False
             if not state.quiet:
@@ -426,6 +704,11 @@ def _make_handler(state: ServerState) -> type:
             if not isinstance(prefix, list) or not all(
                     isinstance(t, int) and not isinstance(t, bool) for t in prefix):
                 return self._error(400, "prefix must be an array of token ids")
+            # Same wall as /completion: warming a prefix that cannot fit is a prefill
+            # that cannot fit, and it reaches the allocator the same way.
+            _, too_big = admit(len(prefix), 0, state.n_ctx(), state.safe_ctx())
+            if too_big:
+                return self._error(400, too_big)
             state.busy = True
             try:
                 status, fed = state.call(state.eng.warm_prefix, list(prefix))
@@ -489,6 +772,11 @@ def run(args: Any) -> int:
         cache_dir=cache_dir,
         kv_cache_max_bytes=(kv_cache_max_gb if kv_cache_max_gb is not None else 8) * 1024**3,
     )
+    # The same sampler-env application the local CLI does, through the same call — a
+    # server started with CHAD_MIN_P must sample like a local chad started with it, or the
+    # whole point of serving THIS model (measuring what people actually run) is lost.
+    # Shared rather than re-listed here on purpose: see cli.apply_sampler_env.
+    cli.apply_sampler_env(eng)
     sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
     # The weights load ON the engine thread, not this one: MLX's streams are
     # thread-local, so whatever thread loads the model must be the thread that later
@@ -500,6 +788,10 @@ def run(args: Any) -> int:
         state.close()
         cli._fail_model_load(model_id, e)
         return 2
+    # Warm the memory probe before anything can call it. The first `safe_ctx()` pays a
+    # module import and a cold Metal device query (~55 ms measured); that belongs to
+    # startup, not to whichever request happens to arrive first.
+    state.safe_ctx()
     try:
         srv = build_server(state, host, port)
     except OSError as e:

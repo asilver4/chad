@@ -9,6 +9,7 @@ way to prove the two halves actually agree on the wire.
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -39,6 +40,11 @@ class FakeEngine:
         self.threads = set()
         self.sampler_seen = None
         self.stop_after = None      # emit N tokens then pretend the client is gone
+        self.cache_reset = False    # report an OOM cache drop in the turn's stats
+        self.hold = None            # threading.Event: block mid-generation on demand
+        self.produced = 0           # tokens emitted so far (perf tests poll this)
+        self.delay = 0.0            # per-token cost, so a turn can still be IN FLIGHT
+                                    # when a test does something to the client
 
     def _note_thread(self):
         # MLX streams are thread-local, so EVERY engine call must land on the same
@@ -55,11 +61,18 @@ class FakeEngine:
         for i, p in enumerate(pieces):
             if should_stop and should_stop():
                 break
+            if self.hold is not None:
+                self.hold.wait(10)
+            if self.delay:
+                time.sleep(self.delay)
             on_token and on_token(p if i == 0 else " " + p)
             emitted += 1
+            self.produced = emitted
         self._cached_ids = list(prompt_ids) + self.gen_ids
         return self.out, GenStats(prompt_tokens=7, cached_tokens=3, prefill_s=0.5,
-                                  generated_tokens=emitted, gen_s=0.25)
+                                  generated_tokens=emitted, gen_s=0.25,
+                                  gen_ids=list(self.gen_ids),
+                                  cache_reset=self.cache_reset)
 
     def reset(self):
         self._note_thread()
@@ -127,8 +140,10 @@ def test_parse_completion_request_takes_token_ids_verbatim():
     assert p["n_predict"] == 64
     assert p["temperature"] == 0.7
     assert p["min_p"] == 0.05
-    assert p["top_p"] == 0.0        # unset knob stays OFF, chad's convention
+    assert p["top_p"] is None       # ABSENT — distinct from an explicit 0.0 (= OFF)
     assert p["cache_prompt"] is True
+    # …and a knob the client explicitly disables is not the same as one it never sent
+    assert serve.parse_completion_request({"prompt": [1], "top_p": 0.0})["top_p"] == 0.0
 
 
 def test_parse_completion_request_rejects_junk():
@@ -420,6 +435,368 @@ def test_health_answers_while_the_engine_thread_is_busy(live_server):
     finally:
         release.set()
         blocked.join(5)
+
+
+# --- backpressure, cancellation, and the cache-state contract -------------
+#
+# These are behavioral-PERFORMANCE tests: not "how fast", but "what happens when the
+# other end misbehaves". Every one of them corresponds to a way the server used to lose,
+# and none needs a model — the fake engine streams as fast as the socket will take it.
+#
+#   client behavior          before                     asserted here
+#   ───────────────          ──────                     ─────────────
+#   hangs up (FIN/RST)       write raises → cancel ✓    still cancels
+#   stops reading, stays up  ENGINE BLOCKS FOREVER ✗    engine finishes, client killed
+#   reads slowly             engine ran at reader speed  engine runs ahead of reader
+#   second request arrives   queued ✓                   still served, not dropped
+
+def _post(url, body, read=True):
+    """Raw socket POST so a test can choose NOT to read the response."""
+    import socket
+    host, port = url[len("http://"):].split(":")
+    s = socket.create_connection((host, int(port)), timeout=10)
+    payload = json.dumps(body).encode()
+    s.sendall(b"POST /completion HTTP/1.1\r\nHost: x\r\n"
+              b"Content-Type: application/json\r\nContent-Length: "
+              + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+    if read:
+        s.recv(65536)
+    return s
+
+
+def _wide_engine(ntok=4000, seglen=400):
+    """A fake whose tokens are big enough to fill socket buffers quickly, so a
+    non-reading client reaches backpressure in a test-sized amount of time."""
+    return FakeEngine(out=" ".join("x" * seglen for _ in range(ntok)))
+
+
+def test_a_client_that_stops_reading_cannot_wedge_the_engine_thread(monkeypatch):
+    """THE regression test. A client that connects, asks for a completion and then
+    stops reading — a suspended container, a slept laptop, a debugger breakpoint in the
+    client's token loop — used to block the engine thread inside a socket write, with no
+    timeout on it. That thread is the ONLY one allowed to touch MLX, so one such client
+    took the whole server down for everyone, indefinitely, while /health still answered
+    `ok`. `should_stop` could not save it either: it fires when a write RAISES, and a
+    blocked write does not raise, it waits.
+
+    The engine must finish (or abandon) this turn on its own and be free afterwards."""
+    # Production waits a full minute before writing a client off; the mechanism is
+    # identical at two seconds and the test doesn't have to sit through the wait.
+    monkeypatch.setattr(serve, "WRITE_STALL_S", 2.0)
+    eng = _wide_engine()
+    state = serve.ServerState(eng, model_id="t", quiet=True)
+    srv = serve.build_server(state, "127.0.0.1", 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        dead_client = _post(url, {"prompt": [1, 2, 3], "n_predict": 4000}, read=False)
+        # Let it stream until the socket buffers are full and it has to block.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            n = eng.produced
+            time.sleep(0.5)
+            if eng.produced == n and n > 0:
+                break               # production has stalled: backpressure reached
+        assert eng.produced > 0, "never streamed anything, test proves nothing"
+        # The engine must NOT still be pinned there. Whether it cancelled or drained,
+        # the one unacceptable outcome is "stuck forever holding the only engine
+        # thread". One stall budget plus slack is the whole allowance.
+        released = state.submit(lambda: "free").result(timeout=30)
+        assert released == "free", "engine thread never came back"
+        dead_client.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        state.close()
+
+
+def test_a_slow_reader_does_not_gate_the_engine():
+    """Decoupling, stated positively: the engine writes into a queue, so it runs ahead
+    of a client that drains slowly instead of being paced by it. Before, the engine
+    thread did the socket write itself and a 50ms-per-read consumer dropped its measured
+    rate from 82k to 5.8k tok/s — TCP backpressure applied directly to MLX."""
+    eng = FakeEngine(out=" ".join("y" * 20 for _ in range(300)))
+    state = serve.ServerState(eng, model_id="t", quiet=True)
+    srv = serve.build_server(state, "127.0.0.1", 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        s = _post(url, {"prompt": [1], "n_predict": 300})
+        time.sleep(1.0)             # read nothing at all for a beat…
+        # …by which time the engine, unblocked, has produced far more than the handful
+        # of tokens a lockstep writer could have pushed into an undrained socket.
+        assert eng.produced >= 100, f"engine only produced {eng.produced} while idle"
+        s.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        state.close()
+
+
+def test_a_second_completion_is_queued_not_dropped(live_server):
+    """One KV cache means one generation at a time, so a concurrent request must WAIT
+    and then run — not fail, and not race the prefix the running turn is built on."""
+    url, eng, state = live_server
+    eng.hold = threading.Event()
+    out = {}
+
+    def first():
+        c = _client(url)
+        out["first"] = c.generate([1, 2, 3], max_tokens=8)[0]
+
+    t = threading.Thread(target=first, daemon=True)
+    t.start()
+    time.sleep(0.3)                         # first request is inside the engine, blocked
+    second = threading.Thread(
+        target=lambda: out.update(second=_client(url).generate([4], max_tokens=4)[0]),
+        daemon=True)
+    second.start()
+    time.sleep(0.3)
+    assert "second" not in out, "second generation ran while the first held the engine"
+    eng.hold.set()                          # release the first
+    t.join(10)
+    second.join(10)
+    assert out.get("first") and out.get("second"), "a queued request was dropped"
+
+
+def test_hangup_mid_stream_still_cancels_through_the_queue(live_server, monkeypatch):
+    """The queue sits between the engine and the socket now, so prove the cancel signal
+    still crosses it: a client that hangs up must stop generation, not merely stop the
+    writes."""
+    monkeypatch.setattr(serve, "WRITE_STALL_S", 2.0)
+    url, eng, _ = live_server
+    eng.out = " ".join("z" * 200 for _ in range(2000))
+    eng.delay = 0.002           # ~4s of generation, so the turn is genuinely in flight
+    s = _post(url, {"prompt": [1], "n_predict": 2000})
+    time.sleep(0.3)
+    s.close()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        n = eng.produced
+        time.sleep(0.5)
+        if eng.produced == n:
+            break
+    assert eng.produced < 2000, "generation ran to completion for a client that left"
+
+
+# --- the sampler-config contract ------------------------------------------
+
+def test_an_unset_sampler_knob_leaves_the_server_config_alone():
+    """A server started with CHAD_MIN_P / CHAD_TOP_P must keep them. The knobs used to
+    default to 0.0 and get written onto the engine unconditionally, so every request
+    that didn't mention them ZEROED the operator's config — and chad's own client only
+    sends min_p/top_p when they are armed, so that was nearly every request. Forcing
+    temperature to 0.0 also picks the engine's decode strategy for it (the prompt-lookup
+    path is gated on temp == 0.0)."""
+    eng = FakeEngine()
+    eng.temp, eng.min_p, eng.top_p = 0.7, 0.05, 0.95        # the operator's config
+    serve.stream_completion(eng, serve.parse_completion_request({"prompt": [1]}),
+                            sink()[0])
+    assert eng.sampler_seen == (0.7, 0.05, 0.95), "an absent knob overwrote the config"
+    assert (eng.temp, eng.min_p, eng.top_p) == (0.7, 0.05, 0.95)
+
+
+def test_an_explicit_zero_still_disarms_a_knob():
+    """0 = OFF is chad's convention, so a client that deliberately sends 0.0 must be
+    able to turn a server-side knob off. That is the whole reason absent is None."""
+    eng = FakeEngine()
+    eng.min_p = 0.05
+    serve.stream_completion(eng, serve.parse_completion_request(
+        {"prompt": [1], "min_p": 0.0}), sink()[0])
+    assert eng.sampler_seen[1] == 0.0       # explicitly disarmed for this request…
+    assert eng.min_p == 0.05                # …and restored for the next one
+
+
+# --- the cache-state contract on the wire ---------------------------------
+
+def test_generated_ids_come_from_the_engine_not_a_cache_slice():
+    """The ids on the wire must be what the engine says it generated. They used to be
+    recovered by slicing `_cached_ids` past the prompt, which only holds on the main
+    decode path: the prompt-lookup path stores what it FED the cache (the final pending
+    token is deliberately absent) so the slice came up short by one every turn."""
+    eng = FakeEngine(out="a b c", gen_ids=[7, 8, 9])
+    write, payloads = sink()
+    # a PLD-shaped cache: short by the last generated token, exactly as fed_ids is
+    real_generate = eng.generate
+
+    def pld_generate(prompt_ids, **kw):
+        text, stats = real_generate(prompt_ids, **kw)
+        eng._cached_ids = list(prompt_ids) + [7, 8]     # what was FED, not what was made
+        return text, stats
+
+    eng.generate = pld_generate
+    serve.stream_completion(eng, serve.parse_completion_request({"prompt": [1, 2]}),
+                            write)
+    assert payloads()[-1]["tokens"] == [7, 8, 9], "fell back to the cache slice"
+
+
+def test_a_cache_reset_tells_the_client_to_drop_its_mirror(live_server):
+    """After a Metal OOM the engine rebuilds from empty, so NOTHING is resident — not
+    even the prompt. Generated ids alone cannot say that, and a client that mirrored
+    prompt+generation would size its next prefill against a cache that doesn't exist.
+    The flag is the only honest answer."""
+    url, eng, _ = live_server
+    eng.cache_reset = True
+    c = _client(url)
+    text, stats = c.generate([1, 2, 3], max_tokens=8)
+    assert text == "hello world"
+    assert stats.cache_reset is True
+    assert c._cached_ids == [], "client mirrored a cache the server had already dropped"
+
+
+# --- admission control: never let a prompt reach the Metal allocator ------
+
+def test_admit_clamps_the_budget_and_refuses_what_cannot_fit():
+    """Pure, so the wall is testable without a model. Generation has to fit BESIDE the
+    prompt in one KV cache — the budget is what's left, not what was asked for."""
+    assert serve.admit(1000, 512, 8192) == (512, None)      # fits, untouched
+    assert serve.admit(8000, 512, 8192) == (192, None)      # clamped to the room left
+    n, err = serve.admit(8192, 512, 8192)                   # no room for even one token
+    assert n == 0 and "context window is 8192" in err
+    n, err = serve.admit(99999, 512, 8192)
+    assert n == 0 and "99999 tokens" in err
+    # an engine that hasn't reported a window yet must not invent one and reject
+    # everything against a made-up number
+    assert serve.admit(99999, 512, 0) == (512, None)
+
+
+def test_admit_tightens_to_the_live_memory_wall_but_never_widens_past_it():
+    """Two walls, on purpose. The advertised window is pinned so clients can budget
+    against a number that doesn't move; the admission wall is live, because the Metal
+    budget is blind to other processes and the KV cache grows into physical pages 1:1.
+    Live pressure may only ever TIGHTEN — a memory probe that returned more than the
+    model's own window must never be allowed to admit past it."""
+    assert serve.admit(5000, 512, 32768, 8192) == (512, None)   # inside both walls
+    n, err = serve.admit(5000, 512, 32768, 4096)     # fits the window, not today's memory
+    assert n == 0 and "only 4096 tokens fit in GPU memory right now" in err
+    assert "advertises a 32768-token window" in err  # so the remedy is obvious
+    # under pressure the budget is clamped to the LIVE room, not the advertised room
+    assert serve.admit(3000, 4096, 32768, 4096) == (1096, None)
+    # a probe that reads HIGH cannot widen the wall past the real window
+    assert serve.admit(3000, 99999, 8192, 999999) == (5192, None)
+    # no probe available (no MLX, engine not loaded) → pinned window stands, as before
+    assert serve.admit(3000, 512, 8192, 0) == (512, None)
+
+
+def test_health_surfaces_memory_pressure_before_a_400_does(live_server):
+    """A tightened wall is invisible from the client side — it budgeted against /props
+    and everything looks fine until a request bounces. Report it where a monitor can see
+    it coming."""
+    url, _, state = live_server
+    with urllib.request.urlopen(url + "/health", timeout=5) as r:
+        body = json.loads(r.read())
+    assert body["n_ctx"] == 8192
+    assert body["safe_ctx"] <= body["n_ctx"]        # tightening only, never widening
+    assert body["ctx_pressure"] is (body["safe_ctx"] < body["n_ctx"])
+    # simulate another process taking the GPU: the wall tightens, the ADVERTISED
+    # window does not move (clients have already baked it in)
+    state.safe_ctx = lambda: 4096
+    with urllib.request.urlopen(url + "/health", timeout=5) as r:
+        body = json.loads(r.read())
+    assert body["n_ctx"] == 8192 and body["safe_ctx"] == 4096
+    assert body["ctx_pressure"] is True
+    with urllib.request.urlopen(url + "/props", timeout=5) as r:
+        assert json.loads(r.read())["default_generation_settings"]["n_ctx"] == 8192
+
+
+def test_a_prompt_that_no_longer_fits_in_memory_is_a_400_not_an_oom(live_server):
+    """The field failure this guard exists for: the prompt fit at load, then a docker
+    stack took tens of GB. The pinned number still says yes; physical memory says no.
+    A Metal OOM raised on a completion handler is not catchable — prevention is the only
+    lever, so the request has to bounce before it reaches the allocator."""
+    url, eng, state = live_server
+    state.safe_ctx = lambda: 4096                   # pressure arrived after load
+    req = urllib.request.Request(
+        url + "/completion",
+        data=json.dumps({"prompt": list(range(6000))}).encode(),   # < 8192, > 4096
+        headers={"Content-Type": "application/json"}, method="POST")
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=5)
+    assert e.value.code == 400
+    assert "GPU memory right now" in e.value.read().decode()
+    assert not eng.calls, "a prompt that could not fit still reached the engine"
+
+
+def test_the_live_wall_survives_a_probe_that_cannot_run(live_server):
+    """The guard must never be the thing that breaks the server. No MLX, an unloaded
+    engine, a device_info that raises — all of it degrades to the pinned window."""
+    url, _, state = live_server
+    state.eng.kv_bytes_per_token = 0.0              # nothing measured to divide by
+    state._safe_ctx_cache = (0.0, 0)
+    assert state.safe_ctx() == 8192                 # pinned window, no exception
+    c = _client(url)
+    assert c.generate([1, 2, 3], max_tokens=4)[0] == "hello world"
+
+
+def test_an_oversized_prompt_is_a_400_before_anything_is_prefilled(live_server):
+    """The guard exists for the client that DIDN'T budget: a stale pinned context, a
+    plain curl, a non-chad client. Overrunning the window is not a clean failure — it is
+    a Metal allocation the engine may not survive, and an OOM raised on a completion
+    handler can take the process with it. One caller gets a 400; nobody gets an OOM."""
+    url, eng, _ = live_server                       # effective_ctx == 8192
+    req = urllib.request.Request(
+        url + "/completion",
+        data=json.dumps({"prompt": list(range(9000))}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=5)
+    assert e.value.code == 400
+    assert "context window is 8192" in e.value.read().decode()
+    assert not eng.calls, "the engine was touched by a request that could never fit"
+
+
+def test_the_generation_budget_is_clamped_to_the_room_left(live_server):
+    url, eng, _ = live_server
+    c = _client(url)
+    c.generate(list(range(8000)), max_tokens=4096)
+    # prompt 8000 + budget 4096 would need 12096 of an 8192 window
+    assert eng.calls[0][2] == 192, f"max_tokens reached the engine as {eng.calls[0][2]}"
+
+
+def test_warm_refuses_a_prefix_that_cannot_fit(live_server):
+    """A warm-start is a prefill, so it hits the same wall — and this one is easy to
+    overshoot, since the prefix is assembled from a system prompt plus every tool schema."""
+    url, eng, _ = live_server
+    req = urllib.request.Request(
+        url + "/warm", data=json.dumps({"prefix": list(range(9000))}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=5)
+    assert e.value.code == 400
+    assert not [x for x in eng.calls if x[0] == "warm"]
+
+
+# --- keepalive: a silent stream is a dead stream to any HTTP client -------
+
+def test_a_long_silent_prefill_keeps_the_socket_warm(live_server, monkeypatch):
+    """Clients time out on BYTES, not on our progress. A cold prefill of a long prompt
+    emits no tokens for minutes, and chad's own client passes `timeout` to urlopen, which
+    applies it PER READ — so silence gets the turn killed just before the first token.
+    Worse, a socket timeout reads as transient, so the agent re-issues the step and pays
+    for the same prefill again. SSE comment lines exist for exactly this; the client's
+    parser already discards them (`parse_sse_chunk` returns None for a line starting ':')."""
+    monkeypatch.setattr(serve, "KEEPALIVE_S", 0.2)
+    url, eng, _ = live_server
+    eng.hold = threading.Event()                # stall "prefill" before the first token
+    s = _post(url, {"prompt": [1, 2, 3]}, read=False)
+    s.settimeout(5)
+    got = b""
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline and b"keepalive" not in got:
+        try:
+            got += s.recv(4096)
+        except OSError:
+            break
+    eng.hold.set()
+    s.close()
+    assert b": keepalive" in got, "stream went byte-silent through a long prefill"
+
+
+def test_a_keepalive_is_invisible_to_the_client_parser():
+    """The wire is shared with stock llama.cpp clients, so the keepalive must be a no-op
+    to any SSE reader — not a chunk they have to know about."""
+    from chad.completion_engine import parse_sse_chunk
+    assert parse_sse_chunk(": keepalive") is None
 
 
 def test_health_reports_whether_the_disk_spill_path_is_armed(live_server):

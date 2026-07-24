@@ -65,6 +65,39 @@ def _env_float(name):
     return float(val) if val else None
 
 
+# The three sampler knobs travel TOGETHER, as one call, deliberately.
+#
+# They used to be three sibling blocks inlined in `main()`, which meant every serve path
+# that builds its own engine had to remember to copy all three — and `chad serve` didn't
+# copy any, so a server started with CHAD_MIN_P ran without it and nothing said so. The
+# failure shape is that sibling settings drift ONE AT A TIME: a later fix honors the field
+# it touched, looks complete, and leaves its neighbours silently dead. There is one
+# function now, so a caller cannot honor `temp` and forget `min_p`.
+SAMPLER_ENV = (("temp", "CHAD_TEMP"), ("min_p", "CHAD_MIN_P"), ("top_p", "CHAD_TOP_P"))
+
+
+def apply_sampler_env(eng):
+    """Apply the sampler-knob environment overrides to `eng`, in place.
+
+    CHAD_TEMP: sampling temperature, all backends. The default stays 0.0 (greedy —
+    reproducible, and the MLX prompt-lookup fast path requires it), but greedy has a
+    failure mode measured in NIGHT-7: a stall/garbled call replays itself byte-identically
+    on every retry and across "independent" bench reps. Benchmarks and unattended runs
+    should set e.g. CHAD_TEMP=0.7 (what the field harnesses run) so retries can take a
+    different path.
+
+    CHAD_MIN_P / CHAD_TOP_P: quant-tail anti-confabulation knobs, off (0.0) by default —
+    trim the sub-noise-floor logit tail without touching temp."""
+    for attr, var in SAMPLER_ENV:
+        raw = config.env_str(var)
+        if not raw:
+            continue
+        try:
+            setattr(eng, attr, float(raw))
+        except ValueError:
+            sys.stderr.write(f"[ignoring {var}={raw!r}: not a number]\n")
+
+
 def _version_string():
     """chad <version> (<vcs commit>) — commit resolves for git installs via
     dist-info/direct_url.json, or from the dev clone's .git; absent otherwise."""
@@ -537,34 +570,7 @@ def main():
             kv_cache_max_bytes=kv_cache_max_bytes,
         )
 
-    # CHAD_TEMP: sampling temperature override, all backends. The default stays 0.0
-    # (greedy — reproducible, and the MLX prompt-lookup fast path requires it), but
-    # greedy has a failure mode measured in NIGHT-7: a stall/garbled call replays
-    # itself byte-identically on every retry and across "independent" bench reps.
-    # Benchmarks and unattended runs should set e.g. CHAD_TEMP=0.7 (what the field
-    # harnesses run) so retries can take a different path.
-    _temp = config.env_str("CHAD_TEMP")
-    if _temp:
-        try:
-            eng.temp = float(_temp)
-        except ValueError:
-            sys.stderr.write(f"[ignoring CHAD_TEMP={_temp!r}: not a number]\n")
-
-    # CHAD_MIN_P / CHAD_TOP_P: quant-tail anti-confabulation knobs, off
-    # (0.0) by default — trim sub-noise-floor logit tail without touching temp.
-    _min_p = config.env_str("CHAD_MIN_P")
-    if _min_p:
-        try:
-            eng.min_p = float(_min_p)
-        except ValueError:
-            sys.stderr.write(f"[ignoring CHAD_MIN_P={_min_p!r}: not a number]\n")
-
-    _top_p = config.env_str("CHAD_TOP_P")
-    if _top_p:
-        try:
-            eng.top_p = float(_top_p)
-        except ValueError:
-            sys.stderr.write(f"[ignoring CHAD_TOP_P={_top_p!r}: not a number]\n")
+    apply_sampler_env(eng)
 
     # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
     # + input come up in ~0.6 s and you can read/queue while it loads (the load itself is

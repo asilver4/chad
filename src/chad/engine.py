@@ -1173,10 +1173,15 @@ class Engine:
             oom_degraded = True
         stats.gen_s = time.time() - (first_token_at or t0)
         stats.generated_tokens = len(gen_ids)
+        stats.gen_ids = list(gen_ids)
 
         if oom_degraded:
             self._reset_cache()
             mx.clear_cache()
+            # Nothing is resident now, not even the prompt. Say so: a caller mirroring
+            # our cache (chad serve's remote client) would otherwise assume prompt+gen
+            # and estimate its next prefill against a cache that no longer exists.
+            stats.cache_reset = True
             return text, stats
         # The cache now holds prefix + the tokens we generated.
         self._cached_ids = prompt_ids + gen_ids
@@ -1377,6 +1382,10 @@ class Engine:
             on_token(detok.last_segment)
         stats.gen_s = time.time() - (first_token_at or t0)
         stats.generated_tokens = len(out_ids)
+        # What we GENERATED, which is not what we FED: `fed_ids` below deliberately
+        # excludes the final pending token, so it is the wrong list to report to a
+        # caller asking what this turn produced.
+        stats.gen_ids = list(out_ids)
 
         # fed_ids is exactly what's resident in the KV cache, so it's the correct
         # prefix to diff against next turn.

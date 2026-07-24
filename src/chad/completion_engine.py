@@ -56,7 +56,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Iterator, Optional
 
-from .base_engine import THINK_CLOSE, BackendError, GenStats, think_ceiling_hit
+from .base_engine import THINK_CLOSE, BackendError, GenStats, TailWatch, think_ceiling_hit
 
 # The capability names are the wire contract between this client and `chad serve`;
 # they live with the server so there is exactly one spelling of each. `serve` imports
@@ -401,6 +401,15 @@ class CompletionEngine:
         gen_ms_from_timings = 0.0       # summed predicted_ms — only trusted if EVERY request
                                         # in the step reported it (see all_requests_timed below)
         all_requests_timed = True
+        # Incremental stop-marker detection. Both of these used to re-scan the ENTIRE
+        # accumulated text after every single token, which is quadratic in the length of
+        # the turn: 777ms of pure CPU on a 16k-token generation, spent on the very thread
+        # that has to drain the token stream. Watchers carry only the few characters a
+        # match could straddle. They live outside the request loop because `text` keeps
+        # accumulating across a salvage continuation.
+        stop_watch = TailWatch(stop_texts or [])
+        think_watch = TailWatch(["</think>"] if think_ceiling else [])
+        cache_reset = False             # server dropped its cache mid-turn (Metal OOM)
         t0 = time.time()
         first_at: Optional[float] = None
         cur_prompt_ids = prompt_ids
@@ -433,6 +442,11 @@ class CompletionEngine:
                                                transient=code >= 500)
                         if chunk.get("timings"):   # final stop-chunk carries real telemetry
                             timings = chunk["timings"]
+                        if chunk.get("cache_reset"):
+                            # `chad serve` telling us its prefix cache was dropped (OOM
+                            # recovery): NOTHING is resident on the server now, so the
+                            # mirror must go empty rather than record prompt+generation.
+                            cache_reset = True
                         gen_ids.extend(chunk.get("tokens") or [])
                         seg = chunk_text(chunk)
                         if not seg:
@@ -441,18 +455,23 @@ class CompletionEngine:
                             first_at = time.time()
                             stats.prefill_s = first_at - t0
                         text += seg
+                        # Feed both watchers before any early exit, so neither can miss a
+                        # marker that lands in the same segment as a break.
+                        stop_hit = stop_watch.feed(seg)
+                        think_closed = think_watch.feed(seg)
                         n_chunks += 1
                         n_out += 1
                         if on_token:
                             on_token(seg)
-                        if stop_texts and any(s in text for s in stop_texts):
+                        if stop_hit:
                             should_stop = lambda: True  # noqa: E731 — bail on next outer read
                             break
                         # Close-and-continue: still inside <think> past the ceiling. Stop
                         # this request and re-request with the force-closed ids appended
                         # (below). Checked before stop_condition so the high pathological
                         # ceiling salvages rather than ending the step.
-                        if think_ceiling_hit(text, n_out, think_ceiling):
+                        if think_ceiling_hit(text, n_out, think_ceiling,
+                                             think_closed=think_closed):
                             salvage_here = True
                             break
                         if stop_condition is not None and stop_condition(text, n_out):
@@ -496,6 +515,10 @@ class CompletionEngine:
             # reuses the common prefix (no detokenize — this backend is token-native).
             close_ids = list(self.tok.encode(THINK_CLOSE, add_special_tokens=False))
             text += THINK_CLOSE
+            # The injected close is part of the text the watchers are tracking; feed it
+            # or the continuation re-trips the ceiling it was meant to resolve.
+            think_watch.feed(THINK_CLOSE)
+            stop_watch.feed(THINK_CLOSE)
             all_gen_ids.extend(close_ids)
             n_out += len(close_ids)
             stats.salvaged = True
@@ -513,10 +536,15 @@ class CompletionEngine:
             # estimate and say so.
             stats.gen_s = time.time() - (first_at or t0)
             stats.approximate = True
+        stats.gen_ids = list(all_gen_ids)
         # Mirror the server's slot cache (prompt + generation), exactly like the MLX
         # engine's `_cached_ids = prompt_ids + gen_ids` — this is what makes the next
         # turn's pre-generation estimate accurate in append-only transcripts. Correct
         # across a salvage too: `all_gen_ids` already carries gen1 + THINK_CLOSE + gen2,
         # which is exactly what the server's own slot cache holds after the continuation.
-        self._cached_ids = prompt_ids + all_gen_ids
+        # …unless the server told us it dropped the cache: then it holds nothing, and
+        # mirroring prompt+generation would make the next prefill estimate confidently
+        # wrong instead of merely conservative.
+        stats.cache_reset = cache_reset
+        self._cached_ids = [] if cache_reset else prompt_ids + all_gen_ids
         return text, stats
