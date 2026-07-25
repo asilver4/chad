@@ -54,12 +54,35 @@ job. Why the cache is *append-only* (and why that's the right trade for Ornith) 
 
 ## Why decode sits where it does
 
-Token generation is **memory-bandwidth bound**: each token streams the resident weights
-through the chip once, so `tok/s ≈ bandwidth / resident-bytes-per-token`. On this M4 Pro
-(~273 GB/s) the 9B's ~5 GB of 4-bit weights cap decode near **~46 tok/s**; the 35B MoE
-touches fewer bytes per token (sparse experts) and lands near **~71 tok/s**. This is a
-property of the machine, not the harness — it's the ceiling chad runs *at*, not past. "As
-fast as a MacBook Pro gets — no faster." 🗿
+The intuitive answer is "memory bandwidth" — each token streams the resident weights
+through the chip once, so `tok/s ≈ bandwidth / resident-bytes-per-token`. That's the right
+first-order story for the 9B dense model, whose ~5 GB of 4-bit weights cap decode near
+**~46 tok/s** on this M4 Pro (~273 GB/s).
+
+It is **not** what limits the 35B MoE, and that matters if you're thinking about making it
+faster. In-situ ablation of its decode step puts bandwidth-minimal cost around 9 ms against
+~14 ms real: the step issues roughly **400 Metal kernels per token**, each carrying ~9 µs of
+launch and gap latency, so the 35B is **dispatch-bound, not bandwidth-bound**. Two
+consequences:
+
+- Work that removes *kernels* pays; work that removes *bytes* often doesn't. chad's decode
+  fast-path ([`mlx_fastpath.py`](../src/chad/mlx_fastpath.py)) fuses expert and GDN
+  projections and compiles the whole S=1 layer step, removing ~150 dispatches per token.
+- Attention is the exception, and it's a reuse problem rather than a fetch problem. Ablating
+  the math out of the fused quantized-KV kernel leaves it streaming at ~331 GB/s — already at
+  this machine's measured roofline — with ~68% of its runtime spent on the 8 GQA q-heads
+  re-reading staged K/V out of threadgroup memory. That's why
+  [`mlx_qsdpa.py`](../src/chad/mlx_qsdpa.py) has a `simdgroup_matrix` schedule that gives each
+  simdgroup its own position-stream instead of its own head.
+
+The honest caveat, and the reason the numbers above are end-to-end rather than per-kernel:
+**isolated kernel speedups oversell badly.** The attention retile is a measured 1.26–1.40×
+on the kernel and moves the whole decode step ~2%, because attention is only a fifth of it.
+Trust steady-state `chad-bench` tok/s; don't extrapolate from a microbenchmark. 🗿
+
+You don't have to tune any of this. chad picks the fast configuration at startup — the
+KV-cache bit width, the fused-attention schedule, and MLX's runtime settings are chosen from
+measurements on this model and applied for you. `chad-bench` reports what you're getting.
 
 ## The model: Ornith
 

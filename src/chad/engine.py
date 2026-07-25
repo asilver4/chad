@@ -71,6 +71,30 @@ _CKPT_WARM = "warm"
 _CKPT_PUSH = "push"
 
 
+def _log_mlx_provenance() -> None:
+    """Record whether mlx is the PyPI build a `uvx chad-code` user gets, or a
+    locally built one.
+
+    Perf work on this repo has twice been measured against a patched local wheel
+    whose kernels no PyPI user receives (chad-code depends on `mlx>=0.32,<0.33`
+    from PyPI, and `uvx --from git+...` resolves fresh and ignores uv.lock). A
+    local build shows up as a PEP 440 local version segment ('+<sha>'). Logging
+    it means a throughput number can always be traced to the build that produced
+    it, instead of silently describing a configuration we do not ship.
+    """
+    try:
+        import mlx.core as mx
+        ver = str(mx.__version__)
+    except Exception:  # noqa: BLE001 — diagnostics must never break loading
+        return
+    if "+" in ver:
+        log.warning("mlx %s is a LOCAL build, not the PyPI wheel users get — "
+                    "throughput measured here may not be reproducible via "
+                    "`uvx chad-code`", ver)
+    else:
+        log.info("mlx %s (PyPI build — matches what uvx installs)", ver)
+
+
 def _local_path(model_id: str) -> str:
     """Resolve a cached HF repo id to its on-disk snapshot dir so `mlx_lm.load` (and
     `_read_config`) skip the hub revision check — a ~1s network/stat round-trip on every
@@ -386,6 +410,7 @@ class Engine:
         # Decode fast-path (fused projections + compiled S=1 layer step) for the
         # hybrid MoE checkpoint; silent no-op on any other model or on failure.
         from . import mlx_fastpath
+        _log_mlx_provenance()
         mlx_fastpath.install(self.model)
         # Fused quantized-KV decode attention: makes kv_bits=8 a speed win
         # instead of a loss. Patches mlx_lm's quantized SDPA branch
