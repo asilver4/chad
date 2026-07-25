@@ -173,7 +173,6 @@ class CompletionEngine:
         self._caps: set = set()
         self._props_probed: bool = False
         self._cache_stack: list = []    # mirror of the server's quarantine stack
-        self.draft = None               # no draft model (repl status line reads this)
         self.kv_bytes_per_token: float = 0.0   # cli's RAM-aware ctx sizing reads this
 
     # A truthy `cache_dir` is the agent's ONE test for "is a disk KV cache reachable?"

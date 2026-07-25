@@ -134,7 +134,7 @@ def test_template_ids_unwraps_batchencoding():
 def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path, monkeypatch):
     """write → read → done: two real tool dispatches through a real run_turn, a real
     filesystem effect, and clean termination (no spin to max_steps)."""
-    # This test is about the loop's parse→dispatch→terminate spine, not the iter-3
+    # This test is about the loop's parse→dispatch→terminate spine, not the
     # deliverable recheck (which would defer the first done); disable that lever here.
     monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     target = tmp_path / "note.txt"       # .txt: a doc write, so no verify-before-done nudge
@@ -360,7 +360,7 @@ def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path, monkeypatc
     real trace: a productive plan-implementation turn was force-stopped dead at the
     fixed cap, an edit half-applied). With max_steps=4 this script needs 7 steps — each
     window re-earns its extension with an edit+verify, so the loop reaches `done`."""
-    # Orthogonal to the iter-3 deliverable recheck (it would add a step and skew the cap
+    # Orthogonal to the deliverable recheck (it would add a step and skew the cap
     # accounting this test pins); disable that lever here.
     monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     f = tmp_path / "f.py"
@@ -402,7 +402,7 @@ def test_step_cap_stops_and_banks_note_without_progress(tmp_path):
 # --- Iter-2: no-empty-diff terminal gates --------------------------------
 
 def test_no_empty_diff_gate_blocks_prose_end_on_action_task(monkeypatch):
-    """An ACTION task whose model stalls into prose 'final answers' (the NIGHT-7 bail
+    """An ACTION task whose model stalls into prose 'final answers' (the measured bail
     signature: django-14007/sphinx-9230 accepted a 'Let me search…' sentence as the
     final answer with an EMPTY diff and 97% of budget unused) must end as a resumable
     hard stop with a progress note — never as a silent success. (This test is about
@@ -467,7 +467,7 @@ def test_bash_mutation_triggers_syntax_recheck(tmp_path, monkeypatch):
     but used to bypass the edit-tool syntax gate — a file survived 9 blind 'fixes'
     unparseable and nothing said so. A bash step that mutates a file edited this
     turn must get a parse warning appended to its result."""
-    # Not about the iter-3 deliverable recheck (it would defer done here); disable it.
+    # Not about the deliverable recheck (it would defer done here); disable it.
     monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
@@ -488,7 +488,7 @@ def test_bash_mutation_triggers_syntax_recheck(tmp_path, monkeypatch):
 
 # --- backend-error resilience -------------------------------------
 # A transient llama.cpp fault used to escape run_turn and kill the process from
-# cli.main, forfeiting the rest of an unattended task's budget: TB2's
+# cli.main, forfeiting the rest of an unattended task's budget: the benchmark's
 # make-mips-interpreter died at 721s of a 1770s budget on a single 500
 # ("The model produced output that does not match the expected Content-only format").
 
@@ -619,7 +619,7 @@ def test_steering_injects_between_steps_and_run_continues(tmp_path, monkeypatch)
 
 def test_no_drain_hook_means_no_injection(tmp_path, monkeypatch):
     """drain_steering=None (headless / bench / sub-agent) keeps today's transcript
-    byte-identical — no steer messages, no behavior change (zero TB2 risk)."""
+    byte-identical — no steer messages, no behavior change (zero benchmark risk)."""
     monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     target = tmp_path / "note.txt"
     script = [

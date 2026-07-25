@@ -35,7 +35,7 @@ def on(monkeypatch):
     monkeypatch.delenv("CHAD_DISABLE", raising=False)
 
 
-# === iter-2 ================================================================
+# === group "iter2" ================================================================
 
 def test_verify_requires_execution(monkeypatch):
     """A display-only command exiting 0 is not verification — unless ablated."""
@@ -119,7 +119,7 @@ def test_open_tool_call_nudged_without_cap():
     assert kind4 != "garble"  # falls through to the next nudge family
 
 
-# === iter-13 ====================================================
+# === group "iter13" ====================================================
 
 def test_garble_never_final(monkeypatch):
     """Garbles ride their own counter when ON; the OFF arm restores the shared
@@ -216,7 +216,7 @@ def test_structural_reindent(monkeypatch, tmp_path):
         "ablated: no structural reindent, and fit/snap can't fix a multi-level block"
 
 
-# === iter-6 =====================================================
+# === group "iter6" =====================================================
 
 def test_syntax_revert(monkeypatch, tmp_path):
     """The 073 corruption engine: replacing ONE physical line of a multi-line def
@@ -273,7 +273,7 @@ def test_stale_file_guard(monkeypatch, tmp_path):
         "ablated: the stale edit goes straight through"
 
 
-# === iter-7 =====================================================
+# === group "iter7" =====================================================
 
 def test_edit_drift_warn(monkeypatch):
     """The measured drift: a rewrite drops a def still called elsewhere. ON: the
@@ -288,7 +288,7 @@ def test_edit_drift_warn(monkeypatch):
     assert syntaxgate.drift_warn("m.py", before, after) is None
 
 
-# === iter-3 ================================================================
+# === group "iter3" ================================================================
 
 def test_progress_note_rich(monkeypatch):
     n = bite("progress_note_rich")
@@ -346,7 +346,7 @@ def test_edit_fail_kind(monkeypatch):
     assert "identical" in hot and "will not help" in hot
     off(monkeypatch, n)
     cold = guardrails.edit_loop_break(2, 0, kind="noop")
-    assert "verbatim" in cold, "ablated: the pre-iter-3 conflation returns"
+    assert "verbatim" in cold, "ablated: the old conflation returns"
     assert cold != hot
 
 
@@ -502,7 +502,7 @@ def test_subagent_budget_note(monkeypatch, tmp_path):
     assert "sub-agent progress" not in cold, "ablated: the findings die with the sub-agent"
 
 
-# === iter-8 =====================================================
+# === group "iter8" =====================================================
 
 def test_ts_edit_revert(monkeypatch, tmp_path):
     """The vm.js/ars.R class: a targeted edit breaks a clean non-Python file. ON:
@@ -581,7 +581,7 @@ def test_write_diff_note(monkeypatch, tmp_path):
     assert res.startswith("[wrote") and "lines vs previous" not in res
 
 
-# === TB2 deadline awareness =====================================
+# === deadline awareness =========================================
 
 def test_wrapup_window(monkeypatch):
     """Inside the final wall-clock stretch, the wrap-up nudge fires — unless ablated.
@@ -606,7 +606,7 @@ def test_no_think_escalation(monkeypatch):
     assert not levers.enabled(n)
 
 
-# === iter-10 ================================================================
+# === group "iter10" ================================================================
 
 def test_done_audit(monkeypatch):
     """The audit's behavioral bite (a done bounced once with quoted requirements, gone —
@@ -623,7 +623,7 @@ def test_done_audit(monkeypatch):
     assert not levers.enabled(n)
 
 
-# === iter-15 ================================================================
+# === group "iter15" ================================================================
 
 def test_audit_churn_handoff(monkeypatch):
     """The handoff's behavioral bite (an empty-diff done bounced once with the audit
@@ -726,7 +726,7 @@ def test_playbook_levers_have_dedicated_suites(monkeypatch):
     assert profiles.prompt_block(None) == ""
 
 
-# === iter-14 ===============================================================
+# === group "iter14" ===============================================================
 
 def test_edit_typo_match_bite(monkeypatch, tmp_path):
     """ASCII-fied `old` against a typographic file lands only while the rung is on."""

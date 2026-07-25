@@ -126,7 +126,7 @@ def bash_result_verifies(result: str, command: str = "") -> bool:
     false-green: it disarmed every guard while the file didn't even parse)."""
     if result.startswith(("[exit", "[timed out", "[interrupted", "[failed to launch")):
         return False
-    # Gates (2) and (3) together ARE the iter-2 anti-spoof fix; ablating it means
+    # Gates (2) and (3) together ARE the anti-spoof fix; ablating it means
     # accepting any clean exit as verification, which is the pre-fix behavior.
     if not levers.enabled("verify_requires_execution"):
         return True
@@ -313,8 +313,8 @@ def done_rejection(did_work, unverified_edit, empty_done_nudges, verify_nudges):
 # Injected once before the first `done` is accepted (levers.done_spec_recheck). The
 # hidden verifier scores container end-state, so a model that "finished" but wrote its
 # output to the wrong path or in the wrong shape fails silently with budget to spare —
-# the single largest wrong-done bucket (TB2 sam-cell-seg wrote directories where files
-# were required; bn-fit-modify passed 8/9 on a format mismatch). This asks the model to
+# the single largest wrong-done bucket (one benchmark task wrote directories where
+# files were required; another passed 8/9 on a format mismatch). This asks the model to
 # self-check deliverables against the literal task text before it stops.
 DONE_SPEC_RECHECK = (
     "[before you finish — one verification pass, read-only. Re-read the ORIGINAL task "
@@ -358,9 +358,9 @@ def recheck_spiral(post_recheck_edits):
 
 # --- Done-audit ----------------------------------------------------------
 #
-# The TB2.1 autopsy's largest fail bucket (20/43) was `done`s whose final message claimed
-# SPECIFIC verification the hidden checker then rejected — kv-store-grpc done at 84s of
-# 900 ("confirmed via socket test"), overfull-hbox at 205/750 ("zero overfull warnings").
+# The largest measured fail bucket (20/43) was `done`s whose final message claimed
+# SPECIFIC verification the hidden checker then rejected — one task done at 84s of 900
+# ("confirmed via socket test"), another at 205/750 ("zero overfull warnings").
 # The model runs *a* check, but a weaker predicate than the task's own wording, and the
 # generic done_spec_recheck steer above was ON for every one of them. The audit is the
 # task-grounded successor: quote the task statement's own requirement lines back (quoting
@@ -809,7 +809,7 @@ def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
     if noop_edit_streak < 2 or break_nudges >= 2:
         return None
     # Ablating the classifier means every failure gets the nomatch remedy, which is the
-    # pre-iter-3 conflation: a model that pasted `old == new` is told to go re-read and
+    # The old conflation: a model that pasted `old == new` is told to go re-read and
     # paste verbatim — precisely what it just did.
     if not levers.enabled("edit_fail_kind"):
         kind = None
@@ -1110,7 +1110,7 @@ def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = No
     a relaunch re-derived the whole investigation and re-spent the budget it was meant to
     save (django-14007/-14404: the correct fix was stated in prose, then lost).
 
-    `rejected_claim` (plan 107 follow-up — the build-pov-ray poisoning loop): when the
+    `rejected_claim` (the long-build poisoning loop): when the
     turn ended via a REJECTED completion claim (done / final answer blocked by the
     no-empty-diff gate), pass the claim text. The note then (a) leads with an explicit
     warning that the claim was rejected, and (b) drops a working hypothesis that itself
@@ -1145,7 +1145,7 @@ def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = No
         elif role == "tool":
             if content.startswith(_ERROR_PREFIXES) or "Traceback" in content:
                 last_error = content
-    # Ablating `progress_note_rich` reverts to the pre-iter-3 note: file names and
+    # Ablating `progress_note_rich` reverts to the older, thinner note: file names and
     # commands only. Everything the executor cannot reconstruct from a clean context —
     # the diagnosis, the failing signature, what was already looked at — is what the
     # lever adds, and therefore what its delta measures.
@@ -1186,7 +1186,7 @@ def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = No
 
 # --- deadline wrap-up window + early-finish review -----------------------
 # The governor's HARD stop (above) only fires on a NO-PROGRESS band — a turn that keeps
-# landing+verifying is never interrupted. But TB2 scores container end-state, and a
+# landing+verifying is never interrupted. But the benchmark scores container end-state, and a
 # still-working turn that gets SIGKILLed at the wall ships whatever half-applied mess it
 # was mid-edit on. The wrap-up window is the complementary lever: a one-shot WALL-CLOCK
 # nudge, fired regardless of progress, once the turn is inside its final stretch — "land
@@ -1225,9 +1225,9 @@ def _wrapup_text(secs: int) -> str:
             "nothing.]")
 
 
-# --- hard wrap-up abort (103) ---------------------------------------------
+# --- hard wrap-up abort ---------------------------------------------------
 # wrapup_window_nudge above is a SOFT nudge that only lands if a step boundary happens to
-# fall inside the window; the TB2.1 autopsy showed the model is usually buried inside one
+# fall inside the window; the autopsy showed the model is usually buried inside one
 # 80-100s generation when the window opens, so it fired 3/89 and rescued 0. This is the
 # backstop: a wall-clock stop_condition (agent.py) cuts the in-flight generation INSIDE
 # the margin, then forces one time-boxed no-think landing turn. The margin must fit: close
@@ -1291,8 +1291,8 @@ def replenish_continue(total_wall_s, elapsed_s, used_continues,
                        cap: int = AUTO_CONTINUE_TOTAL_CAP,
                        frac: float = AUTO_CONTINUE_REPLENISH_FRAC) -> bool:
     """Grant an auto-continue relaunch beyond the base allowance? The fixed base of 2
-    is wall-blind: build-pov-ray (TB2.1 v1.0.0 run) burned 3 step-capped turns in 637s
-    and gave up with 94.7% of a 12000s budget unused (plan 107 F3). While more than
+    is wall-blind: a long build task burned 3 step-capped turns in 637s and gave up
+    with 94.7% of a 12000s budget still unused. While more than
     `frac` of the task wall remains unspent, keep granting fresh attempts, bounded by
     `cap` total relaunches so a pathological fast-stall loop still terminates well
     before the harness SIGKILL. No wall budget -> never (interactive runs keep the
@@ -1335,9 +1335,9 @@ TURN_THINK_BUDGET_FRAC = 0.35  # the budget's TIME cost should stay <= ~35% of t
 TURN_THINK_MIN_WALL_S = 300.0  # below this wall budget the mechanism is inert: a short
                                # auto-continue tail clamps to LO and half-fires on its
                                # first step, churning against hard_wrapup's landing
-                               # (plan 107 F2 — the regex-log relaunch signature)
+                               # (the regex-log relaunch signature)
 TURN_THINK_REARM_TOK = 3000    # past exhaustion, one forced no-think step is owed per
-                               # this many FURTHER think tokens spent (plan 107 F1)
+                               # this many FURTHER think tokens spent
 
 
 def turn_think_budget(wall_budget_s, decode_tps, frac: float = TURN_THINK_BUDGET_FRAC,
@@ -1362,9 +1362,8 @@ def turn_think_budget_check(turn_think_tokens: int, budget: int, half_fired: boo
                             exhausted: bool):
     """Threshold latch for the cumulative per-turn reasoning budget: 'half' fires ONCE as
     a soft steer at budget/2; 'exhausted' fires ONCE as the transition into the throttled
-    state (see turn_think_throttle — the TB2.1 v1.0.0 run showed a blanket rest-of-turn
-    no-think mute degrades Ornith's tool-call syntax and capability over long tails,
-    plan 107). Once exhausted, always returns (None, half_fired, True) — nothing further
+    state (see turn_think_throttle — a blanket rest-of-turn no-think mute was measured
+    to degrade Ornith's tool-call syntax and capability over long tails). Once exhausted, always returns (None, half_fired, True) — nothing further
     to escalate. Returns (decision, half_fired, exhausted). Pure/testable; the caller
     owns the state."""
     if exhausted:
@@ -1384,10 +1383,10 @@ def turn_think_throttle(turn_think_tokens: int, budget: int, nothink_paid: int,
     no-think steps it has already paid (`nothink_paid`). Self-correcting by design —
     a model that keeps burning reasoning is throttled toward always-off (the old
     persistent-mute behavior), while one that stops over-thinking gets its thinking
-    back once the owed steps are paid. The v1.0.0 full run's evidence for restoring
-    rather than muting: break-filter-js spent 26 straight no-think steps after
-    exhaustion and regressed a run1 pass with garbled landing tool calls (plan 107 F1).
-    Pure/testable; never touches an in-flight generation (086 contract)."""
+    back once the owed steps are paid. The evidence for restoring rather than muting:
+    one task spent 26 straight no-think steps after exhaustion and regressed a
+    previously-passing run with garbled landing tool calls.
+    Pure/testable; never touches an in-flight generation."""
     if turn_think_tokens < budget:
         return False
     owed = 1 + (turn_think_tokens - budget) // max(1, rearm)
@@ -1441,7 +1440,7 @@ def loop_should_abort(loop_nudges: int) -> bool:
     return loop_nudges > 2
 
 
-# --- iter-14: duplicate read-only result elision. Small models re-read files and
+# --- Duplicate read-only result elision. Small models re-read files and
 # re-run searches they have already loaded; on a non-trimmable prefix cache every
 # duplicate body is appended prefill paid on every later step. Hosted harnesses solve
 # this with an opt-in changed-since parameter the model must remember to pass; here
@@ -1478,7 +1477,7 @@ def elide_duplicate_result(name, result, messages):
             f"call.]")
 
 
-# The zero-evidence sub-agent tell (iter-14): a confident, non-empty report produced
+# The zero-evidence sub-agent tell: a confident, non-empty report produced
 # with no tool dispatches came from model memory, not the repo. Warn-not-reject: a
 # local re-spawn doubles GPU cost, a false reject breaks the turn, and a false accept
 # merely restores the pre-warning status quo.

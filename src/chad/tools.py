@@ -353,7 +353,7 @@ def _bash_killed(reason: str, partial: str | None) -> str:
     how far it got (progress %, ETA, the last compile line, a hung-on-input prompt), and
     that partial output is exactly what tells the model whether to raise the timeout,
     background the command, or narrow the work. Discarding it (the old behavior) left the
-    model to guess blind and re-run from zero — the dominant TB2 timeout-loss mode. Same
+    model to guess blind and re-run from zero — the dominant timeout-loss mode. Same
     head/tail clip as a normal result so a long partial can't blow up the prefill."""
     partial = (partial or "").strip()
     if not partial:
@@ -584,7 +584,7 @@ _WRITE_DELTA_MAX = 400_000   # SequenceMatcher is quadratic-ish; skip the note o
 def _write_delta(before: str | None, content: str) -> str:
     """A ' (+a -d lines vs previous)' fragment for an overwrite, so the model can sanity-
     check the size of the change it just made against the size it intended — the cheap
-    core of lydia's diff-echo idea. The 079 dogfood sweep's no-op/loop episodes were
+    core of the diff-echo idea. The dogfood sweep's no-op/loop episodes were
     'model lost track of what the file now holds'; a write that claims a one-line tweak
     but reports -300 lines is the earliest possible tell. Empty for new files, unchanged
     content, or files too large to diff cheaply."""
@@ -628,7 +628,7 @@ def _line_offsets(data: str):
     return offs
 
 
-# Typographic punctuation folded to ASCII for the last-resort edit match (iter-14).
+# Typographic punctuation folded to ASCII for the last-resort edit match.
 # Only characters a model plausibly re-types the other way when
 # quoting prose/docstrings it saw rendered: quotes, dashes, ellipsis, nbsp. Deliberately
 # NOT general unicode normalization — identifiers and string literals in code must not
@@ -1575,7 +1575,7 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
                 files_truncated = True
                 break
             files.append(fp)
-        if not filter_first:  # pre-iter-3: dirs/skipped blobs consumed the budget
+        if not filter_first:  # legacy arm: dirs/skipped blobs consumed the budget
             files = [fp for fp in files if not _skip(fp) and os.path.isfile(fp)]
     for fp in files:
         if should_stop and should_stop():
@@ -1633,7 +1633,7 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
         # issue's own symbol lived in an unsearched file, and the model stalled out
         # trusting the empty result.
         if not levers.enabled("grep_zero_match_notice"):
-            return "[no matches]"  # pre-iter-2: the confident lie, for the ablation arm
+            return "[no matches]"  # legacy arm: the confident lie, for ablation
         scope = path if path not in (".", "") else "the current directory"
         msg = f"[no matches for {pattern!r} in {scope}]"
         if files_truncated:

@@ -683,7 +683,7 @@ class Agent:
             # hypothesis it stated.
             def _salvage(res: str) -> str:
                 if not levers.enabled("subagent_budget_note"):
-                    return res   # pre-iter-2: the capped sub-agent's findings are discarded
+                    return res   # legacy arm: the capped sub-agent's findings are discarded
                 note = sub.budget_note or guardrails.progress_note(sub.messages)
                 if not note:
                     return res
@@ -753,7 +753,7 @@ class Agent:
                     self.ctx_limit = fresh
             except Exception:  # noqa: BLE001 — a pressure probe must never kill a turn
                 pass
-        # ds4-style warm start: on a cold cache, load the system+tools KV from disk
+        # Warm start: on a cold cache, load the system+tools KV from disk
         # (or prefill+persist it once) so the first turn doesn't re-prefill the
         # ~3.2k-token stable prefix every session. Cheap no-op on a warm cache.
         if self.engine.cache_dir and not self.engine._cached_ids:
@@ -814,7 +814,7 @@ class Agent:
         plan_reviews = 0    # one-shot "re-read the plan you just wrote" (levers.plan_review)
         # Files edited this turn -> mtime at last syntax check. Bash can mutate files
         # too (sed -i, python rewrites) but bypasses the write/edit syntax gate; watch
-        # edited files and re-check them after any bash that touched them (iter-2:
+        # edited files and re-check them after any bash that touched them (
         # sphinx-7440's file survived 9 blind `sed -i` "fixes" unparseable, unflagged).
         edited_syntax_watch: dict = {}
         think_cap_hits = 0  # soft think-cap firings this turn (drives escalation)
@@ -832,7 +832,7 @@ class Agent:
         # decode-speed-aware budget. turn_think_exhausted latches the once-only
         # log/steer; past it, no-think steps are paid on a duty cycle
         # (guardrails.turn_think_throttle) rather than muting the rest of the turn —
-        # the blanket mute regressed run1 passes with garbled no-think tails (plan 107).
+        # the blanket mute regressed passing runs with garbled no-think tails.
         # landing_no_think is the 103 landing's own unconditional latch: once the hard
         # wrap-up fires, the landing and everything after it stay no-think regardless.
         turn_think_tokens = 0
@@ -876,7 +876,7 @@ class Agent:
         # Run-task intent (start/boot/serve/… — system-state imperatives with no file
         # deliverable): arms the anti-bail nudges alongside action_task but is kept OUT
         # of the no-empty-diff done gates below, which demand a landed edit a run task
-        # legitimately never makes (plan 107 follow-up: qemu-startup classified as
+        # legitimately never makes (a qemu-startup task was classified as
         # neither, so a prose give-up with 81% of the wall left took the weakest path).
         run_task = self.mode != "plan" and _intent.get("run", False)
         # Progress-aware step cap (see guardrails.extend_step_cap): max_steps is the
@@ -1000,7 +1000,7 @@ class Agent:
             # Turn-level think budget: past exhaustion, forced no-think steps are
             # paid on a duty cycle (one per TURN_THINK_REARM_TOK further think tokens)
             # so thinking RESTORES once the model stops over-spending — a blanket
-            # rest-of-turn mute regressed run1 passes (plan 107 F1). The 103 landing's
+            # rest-of-turn mute regressed passing runs. The hard-landing's
             # landing_no_think stays unconditional.
             _tt_throttled = (turn_think_exhausted
                              and guardrails.turn_think_throttle(
@@ -1150,7 +1150,7 @@ class Agent:
             except BackendError as e:
                 # A transient backend fault (5xx / mid-stream error chunk) used to escape
                 # run_turn and kill the process from cli.main — forfeiting the rest of an
-                # unattended task's budget (TB2 make-mips-interpreter died at 721s of a
+                # unattended task's budget (one benchmark task died at 721s of a
                 # 1770s budget on a single llama.cpp 500). Re-issue the step instead: the
                 # prompt is rebuilt from `messages` each iteration and the failed
                 # generation was never appended, so a retry is a clean re-roll — and at
@@ -1202,7 +1202,7 @@ class Agent:
                     self._emit("stream", "\n")
             # strip any trailing special tokens the template will re-add — and any
             # LEAKED special-token literal anywhere in the text. A quantized model
-            # can emit a stray marker like <|mask_end|> mid-turn (NIGHT-7
+            # can emit a stray marker like <|mask_end|> mid-turn (
             # django-14404 r3: one leaked at step 12 and the turn read as a clean
             # final answer, ending the run rc=0 with an unverified edit); scrubbed
             # here so it can neither pollute the transcript nor masquerade as
@@ -1263,7 +1263,7 @@ class Agent:
             turn_think_tokens += _think_delta
             # Inert below TURN_THINK_MIN_WALL_S: a short auto-continue tail clamps to
             # the LO budget and half-fires on its first step, churning against
-            # hard_wrapup's landing (plan 107 F2 — the regex-log relaunch signature).
+            # hard_wrapup's landing (the regex-log relaunch signature).
             if (self._turn_budget_s
                     and self._turn_budget_s >= guardrails.TURN_THINK_MIN_WALL_S
                     and self.mode != "plan" and not read_only_intent
@@ -1493,7 +1493,7 @@ class Agent:
                 # turn that ends having executed ZERO real tools is never a legitimate
                 # completion — the keyword intent classifier misses tasks like "extract the
                 # secret and save it" (no action verb), so action_task is False and the
-                # gate below wouldn't fire (TB2 vulnerable-secret shipped a 28-token garble
+                # gate below wouldn't fire (one benchmark task shipped a 28-token garble
                 # as its answer). read_only/explain asks are exempt. Banks a note so
                 # auto-continue relaunches fresh instead of shipping nothing.
                 did_nothing = self.mode == "auto" and not read_only_intent and not did_work
@@ -1697,7 +1697,7 @@ class Agent:
                                        "progress note banked; say 'continue' to retry]")
                     return ("[stopped: `done` was called without a landed+verified "
                             "change — say 'continue' to resume]")
-                # Done-audit: the TB2.1 autopsy's largest bucket (20/43 fails)
+                # Done-audit: the largest measured fail bucket (20/43)
                 # was dones whose claimed verification was a WEAKER predicate than the
                 # task's own checker — and the generic recheck below was ON for all of
                 # them. On a done every gate above would accept, bounce ONCE with the
@@ -2093,8 +2093,7 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
          thinking: bool = True, ctx_limit_fn=None):
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
                   resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn)
-    label = engine.model_id.split("/")[-1] + (" + draft" if getattr(engine, "draft", None) else "")
-    print(banner(label, ctx_limit, mode=agent.mode))
+    print(banner(engine.model_id.split("/")[-1], ctx_limit, mode=agent.mode))
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
     while True:
         try:

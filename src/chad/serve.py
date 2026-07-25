@@ -759,14 +759,13 @@ def run(args: Any) -> int:
             "can reach this port can spend your GPU.\n")
 
     from .engine import Engine, sweep_orphan_spills
-    model_id, why = cli._pick_model()
+    model_id, why = cli._pick_model(getattr(args, "model", None))
     cli._ensure_model(model_id)
     cache_dir = os.path.expanduser("~/.cache/chad/kv")
     sweep_orphan_spills(cache_dir, max_age_s=6 * 3600)
     kv_cache_max_gb = cli._env_int("CHAD_KV_CACHE_MAX_GB")
     eng = Engine(
         model_id=model_id,
-        draft_id=None,
         kv_bits=cli._env_int("CHAD_KV_BITS"),
         max_context=cli._env_int("CHAD_MAX_CONTEXT"),
         cache_dir=cache_dir,

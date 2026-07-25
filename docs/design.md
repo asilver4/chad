@@ -84,7 +84,7 @@ three reasons:
    the experience being copied, and every menu before the first task is a place to
    lose someone.
 
-The escape hatches exist and are honest about what they cost: `CHAD_MODEL=<repo or
+The escape hatches exist and are honest about what they cost: `--model <repo or
 local dir>` forces specific weights through the same in-process engine (you keep the
 cache, you lose the tuning fit), and `--backend llama` runs the harness against a remote
 llama.cpp server as a measured ablation arm (you lose the on-disk warm-prefix checkpoint

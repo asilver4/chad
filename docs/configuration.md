@@ -209,7 +209,7 @@ CHAD_CTX_LIMIT=28000    uv run chad      # force the compaction threshold (overr
 CHAD_CTX_RESERVE_GB=2.5 uv run chad      # scratch RAM held back when auto-sizing that threshold
 CHAD_CTX_SLOPE_FACTOR=1.0 uv run chad    # per-token cost multiplier for that auto-sizing (default
                                          # 1.75: measured peak grows ~1.75x the raw KV bytes/token)
-CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
+uv run chad --model /path/to/mlx-model   # power-user escape hatch: run a different MLX model
 CHAD_PREFILL_CHUNK=1024 uv run chad      # force a fixed prefill chunk (default: adaptive — MoE 2048
                                          # / dense 512, decaying to 256 as context+pressure grow)
 CHAD_NO_MEMORY_CLAMP=1  uv run chad      # A/B knob: skip the Metal allocator clamps installed at load
@@ -228,9 +228,10 @@ much headroom is held back for prefill/decode scratch — raise it if you run ot
 memory-hungry apps alongside chad; `CHAD_CTX_SLOPE_FACTOR` tunes the per-token
 multiplier (1.0 recovers the old raw-KV sizing).
 
-`CHAD_MODEL` points chad at any local MLX model directory instead of Ornith. The harness
-is tuned for Ornith, so this is unsupported and mostly there for research — the happy
-path is the single bundled model, no flag.
+`--model` (or `CHAD_MODEL`) takes `35b`, `9b`, `auto`, or any Hugging Face repo id /
+local MLX model directory. The two shorthands are the supported choices; an arbitrary
+model dir is unsupported and mostly there for research — the harness is tuned for Ornith.
+The flag wins over `CHAD_MODEL`, so a globally exported var can't pin every run.
 
 **Memory safety.** At load the engine wires the Metal working set and caps
 the allocator slightly below it (`mx.set_wired_limit`/`set_memory_limit`), so a
@@ -240,13 +241,12 @@ retries. `CHAD_NO_MEMORY_CLAMP=1` disables the clamps (A/B). The compaction thre
 additionally respects host-physical free memory (pressure from Docker or other apps
 that the Metal budget can't see) and is re-checked between turns.
 
-**Forcing the small model.** `CHAD_MODEL` also names another Ornith on Hugging Face, so
-it doubles as the "use the 9B" recipe. chad's default keys on *physical* RAM, so a 24 GB
-Mac with a lot already resident still gets the 35B (~14 GB peak) and can swap-thrash —
-close other apps, or pin the 9B (~5 GB) for the session:
+**Forcing the small model.** chad's default keys on *physical* RAM, so a 24 GB Mac with a
+lot already resident gets the 35B (~14 GB peak) and can swap-thrash — close other apps, or
+pin the 9B (~5 GB) for the session:
 
 ```bash
-CHAD_MODEL=nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX uv run chad
+uv run chad --model 9b
 ```
 
 ### Alternate backend (remote)
@@ -335,13 +335,22 @@ rather than on capability. Pilot a handful of tasks before trusting a full sweep
 A runaway-turn **governor** ends a turn that burns a lot of prefill without landing and
 verifying a change — it nudges at ~50% of budget and, at ~80%, banks a one-line progress
 note and stops. On by default in one-shot/eval runs (interactively the human is the wall
-clock). All three are also settable as flags (`--think-budget`, `--turn-budget-tokens`,
-`--turn-budget-s`); the flag just sets the matching env knob.
+clock).
+
+These are env-only knobs because the only thing that sets them is an unattended harness,
+which already builds a `CHAD_*` environment. `--think-budget` is the one member of the
+family kept on the CLI, since it is a capability/latency trade a person might reach for
+interactively; the former `--think-ceiling`, `--turn-budget-tokens`, `--turn-budget-s`,
+`--auto-continue` and `--review-pass` flags are gone, and passing one is now an error
+rather than a silent no-op.
 
 ```bash
 CHAD_THINK_BUDGET=1500        uv run chad  # soft-cap each step's <think> at N tokens, then force-close + continue
+CHAD_THINK_CEILING=6000       uv run chad  # force-close a runaway <think> but keep decoding the action in the SAME step
 CHAD_TURN_BUDGET_TOKENS=90000 uv run chad  # governor token budget (default 3× the context limit)
 CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off by default
+CHAD_AUTO_CONTINUE=2          uv run chad  # on a hard stop, relaunch a fresh turn seeded with the progress note, N times
+CHAD_REVIEW_PASS=1            uv run chad  # if a one-shot finishes early and clean, spend the slack verifying it
 ```
 
 - **`CHAD_THINK_BUDGET`** — soft-caps each step's `<think>` run at N tokens, force-closes it,
@@ -380,7 +389,7 @@ CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off b
 
 A harness change that ships hardcoded can only be measured by reverting it. Behavioral
 levers are therefore named and switchable, so a bundle of fixes can be attributed with
-leave-one-out ablation instead of a revert per fix. `chad --levers` prints the registry
+leave-one-out ablation instead of a revert per fix. `chad levers` prints the registry
 (it loads no model). A name that isn't registered is a startup error, not a warning: a
 typo would otherwise run the unmodified harness and report the lever as having no effect.
 
@@ -397,7 +406,7 @@ disabled, so a "no measured effect" verdict from an ablation means the fix does 
 not that its guard was misplaced.
 
 ```bash
-uv run chad --levers                              # inventory: every lever + what's active
+uv run chad levers                               # inventory: every lever + what's active
 CHAD_DISABLE=compact_notice uv run chad           # switch one behavior off
 CHAD_DISABLE=plan_review,compact_offload uv run chad
 CHAD_PROFILE=generic uv run chad                  # drop the Ornith-specific accommodations
@@ -425,6 +434,8 @@ CHAD_NO_GOVERNOR=1          uv run chad  # A/B knob: DISABLE the runaway-turn go
 CHAD_NO_REPEAT_GUARD=1      uv run chad  # A/B knob: DISABLE the degenerate-repetition stop
 CHAD_NO_SYNTAX_GATE=1       uv run chad  # A/B knob: DISABLE the post-edit syntax gate
 CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent prefix KV cache
+CHAD_NO_SKILLS=1            uv run chad  # A/B knob: disable all Agent Skill discovery
+CHAD_NO_FASTPATH=1          uv run chad  # A/B knob: disable the fused-projection decode fast path
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
 ```
 
@@ -464,6 +475,25 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   (`guardrails.py`) even in `--yolo`/auto mode. With it set, an injected `rm -rf ~`,
   `mkfs`, `dd of=/dev/…`, fork bomb, or `curl … | sh` is **not** screened before running.
   It is a seatbelt, not a security boundary (a sandbox is) — recommend leaving it unset.
+- **`CHAD_NO_SKILLS`** — turns off [Agent Skill](#agent-skills-agentskillsio) discovery
+  entirely: no `# Skills` prompt section, no skill tool. Set it when a benchmark must not
+  inherit your personal skills, or to A/B what skills are worth. Unlike the other
+  `CHAD_NO_*` vars this one wants a real truthy value (`1`/`true`/`yes`/`on`).
+- **`CHAD_NO_FASTPATH`** — disables the fused-projection + compiled decode step installed
+  at load for the hybrid MoE checkpoint (`mlx_fastpath.py`). Pure speed, no behavior
+  change, so this is an A/B and bisection knob rather than something to run with.
+
+### Dev & instrumentation
+
+Not supported surface — they exist for debugging chad itself, and their formats can change
+between releases.
+
+```bash
+CHAD_TRAJECTORY_JSON=/tmp/traj.json uv run chad  # record an ATIF trajectory (pure observer)
+CHAD_SPILL_DIR=/tmp/spill           uv run chad  # where large tool outputs spill to disk
+CHAD_DUMP_RENDER=/tmp/prompt.txt    uv run chad  # dump the fully-rendered prompt each step
+CHAD_PREFILL_TRACE=/tmp/pf.jsonl    uv run chad  # per-step prefill/cache telemetry
+```
 
 ### Symbolic code intel (repo map & language server)
 
@@ -487,6 +517,32 @@ CHAD_LSP_MAX_RSS_MB=2048 uv run chad  # recycle a language server past this proc
   past this cap it is stopped and restarts fresh on the next request. Guards against an
   analysis server (pyright hit 4 GB on hot symbols) starving the GPU allocator that holds
   the model weights.
+
+### Sessions
+
+Every conversation is persisted per *working directory*, so `-c` in a project resumes that
+project's thread and nothing else:
+
+```
+~/.chad/sessions/<cwdhash>/<session_id>.json   one file per session
+~/.chad/sessions/<cwdhash>/index.json          title / last-updated / turn count
+```
+
+The newest **20** sessions per directory are kept; older ones are pruned on save. Both
+files are created mode `0600` — they hold full tool arguments and results (see [Session
+log & privacy](#session-log--privacy)).
+
+```bash
+uv run chad -c            # resume this directory's most recent session
+uv run chad --resume      # list recent sessions, pick one by number (needs a TTY)
+```
+
+**Resuming forks; it never overwrites.** Both flags seed a *fresh* conversation with the
+old messages, and that conversation mints its own `session_id`. The session you resumed
+from is left exactly as it was, so branching off an old thread can't destroy it and you
+can resume the same starting point twice. The practical consequence: a long session you
+resume repeatedly leaves several sessions behind, which is what `--resume`'s numbered
+list is for.
 
 ### Session log & privacy
 

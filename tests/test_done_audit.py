@@ -1,7 +1,7 @@
 """Done-audit: bounce a would-be-accepted `done` once with the task's own
 requirement lines + stat-level path facts, then accept the next `done` unconditionally.
 
-The extraction tests run against the REAL task statements of the TB2.1 wrong-done set
+The extraction tests run against REAL benchmark task statements from the wrong-done set
 (the 20/43 confident-wrong-done bucket this lever targets) — the corpus the heuristics
 must not garble. The e2e tests drive the real run_turn loop via the scripted engine:
 the once-per-turn latch, precedence below the verify gate, and the supersedes-recheck
@@ -13,7 +13,7 @@ import pytest
 from chad import guardrails
 from test_agent_e2e import _agent, _tool_call
 
-# --- Real TB2.1 task statements (tb21-q6-20260715 trial trajectories, verbatim) ------
+# --- Real benchmark task statements (from trial trajectories, verbatim) -------------
 
 TASK_KV_STORE_GRPC = """\
 You need to build a simple KV store server using grpc that records number values for \

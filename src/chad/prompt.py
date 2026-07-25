@@ -96,8 +96,8 @@ _ACTION_WORDS = (
 # image, install a package), not to land a file edit — completable with zero edits, so
 # these must NOT feed the `action` class (whose no-empty-diff done gate demands a landed
 # edit; arming it here would hard-block every legitimate zero-edit completion). They get
-# their own `run` class, which arms only the anti-bail nudges (TB2.1 qemu-startup,
-# plan 107 follow-up: classified neither action nor read-only, so a prose give-up with
+# their own `run` class, which arms only the anti-bail nudges (a qemu-startup task
+# was classified neither action nor read-only, so a prose give-up with
 # 733s left sailed through the weakest path).
 _RUN_WORDS_RE = re.compile(
     r"\b(start|launch|boot|run|serve|deploy|install|configure|mount|restart|enable"
@@ -121,7 +121,7 @@ _READ_ONLY_NEGATIONS = (
 _READ_ONLY_GLOBAL = ("just explain", "only explain", "read-only", "read only")
 _READ_ONLY_PHRASES = _READ_ONLY_NEGATIONS + _READ_ONLY_GLOBAL
 # …unless the negation names a SPECIFIC file/object — then it's a scope constraint on
-# an action task, not a read-only ask. TB2.1 overfull-hbox ("Do not edit main.tex or
+# an action task, not a read-only ask. A LaTeX task ("Do not edit main.tex or
 # synonyms.txt" — the task is to edit input.tex) and query-optimize ("Do not modify the
 # database file in any way" — the task writes /app/sol.sql) were both classified
 # read_only, which disarmed the no-empty-diff gate, the deliverable recheck, and the
@@ -134,7 +134,7 @@ _SCOPED_NEGATION_RE = re.compile(
     r"\b(?:files?|database|db|repo|repository|director(?:y|ies)|folders?|tables?|"
     r"scripts?)\b)")
 # A demand to deliver the answer INTO a file ("write the number … to /app/answer.txt",
-# "save the results to a file") — overrides an explanatory opener. TB2
+# "save the results to a file") — overrides an explanatory opener. Benchmark
 # count-dataset-tokens (2026-07-12): "Tell me how many … write the integer to the file
 # /app/answer.txt" classified read_only, which disarmed every no-progress gate and let
 # a garbled final step end the task with an empty diff. Explicit negations

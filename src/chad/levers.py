@@ -1,7 +1,7 @@
 """Named harness levers, each individually disableable at runtime.
 
 A harness change that ships hardcoded can only be attributed by a full sweep with the
-code reverted. That is the trap the iter-1/2/3 bundles fell into: fourteen fixes land as
+code reverted. That is the trap the early bundles fell into: fourteen fixes land as
 three diffs, the rate moves, and nothing tells you which fix moved it — or whether one of
 them is a regression the others are masking. Leave-one-out ablation is the cure, and it
 needs exactly one thing from the harness: a way to switch a single behavior off without
@@ -49,8 +49,8 @@ class Lever:
 # what the harness does beyond a bare model call. It is the artifact a reviewer reads to
 # judge whether a benchmark number came from the model or the scaffolding.
 LEVERS: dict[str, Lever] = {
-    # --- iter-2: implemented from the night-7 forensics; only ever measured on the 7
-    #     tasks it was derived from, never on the other 23. ------------------------
+    # --- group "iter2": implemented from the overnight forensics; only ever measured
+    #     on the 7 tasks it was derived from, never on the other 23. --------------
     "verify_requires_execution": Lever(
         "A bash result only clears the unverified-edit flag if the command actually ran "
         "code: reject trivial syntax/compile/version probes and display-only commands. "
@@ -94,7 +94,7 @@ LEVERS: dict[str, Lever] = {
         "mis-indents (the observed 9B failure).",
         "iter5"),
 
-    # --- iter-3: implemented straight off the iter-2 traces. NEVER MEASURED. -------
+    # --- group "iter3": implemented straight off the "iter2" traces. NEVER MEASURED.
     "progress_note_rich": Lever(
         "The relaunch progress note carries the model's last working hypothesis, the "
         "failing-check signature, and the files already examined — not just file names. "
@@ -123,7 +123,7 @@ LEVERS: dict[str, Lever] = {
         "model to re-read the task and confirm every required deliverable exists at the "
         "exact path/format the task asked for (check with ls/cat/test), fixing anything "
         "missing or wrong first. Fires once per turn. Targets the 'declared victory with "
-        "budget to spare, wrong output format' losses (TB2 sam-cell-seg wrote directories "
+        "budget to spare, wrong output format' losses (one benchmark task wrote directories "
         "where files were required; bn-fit-modify 8/9). OFF accepts the first done as-is.",
         "iter3"),
 
@@ -139,7 +139,7 @@ LEVERS: dict[str, Lever] = {
         "chunk). Safe because the prompt is rebuilt from `messages` each step.",
         "iter3"),
 
-    # --- iter-6: line-addressed edits corrupting multi-line structures;
+    # --- group "iter6": line-addressed edits corrupting multi-line structures;
     #     derived from the measured 9B/35B dogfood (10 ignored parse warnings, LOOP
     #     ABORT with a severed def signature). ---------------------------------------
     "syntax_revert": Lever(
@@ -148,7 +148,7 @@ LEVERS: dict[str, Lever] = {
         "reject naming the severed multi-line statement and echoing the current lines. "
         "Applies to edit/replace_lines/insert_lines/replace_symbol/insert_symbol "
         "(non-Python languages and whole-file write are gated separately: "
-        "ts_edit_revert / write_gate, iter8). OFF restores warn-and-land: the 073 "
+        "ts_edit_revert / write_gate). OFF restores warn-and-land: the "
         "dogfood landed ~10 corrupting line edits over ignored parse warnings and "
         "aborted with the file broken.",
         "iter6", REGRESSION_GUARD),
@@ -165,8 +165,8 @@ LEVERS: dict[str, Lever] = {
         "content are blind. The reject refreshes the anchor, so it never locks out.",
         "iter6"),
 
-    # --- iter-7: parse-clean semantic drift in whole-unit rewrites,
-    #     derived from the first successful post-073 dogfood (replace_symbol dropped
+    # --- group "iter7": parse-clean semantic drift in whole-unit rewrites,
+    #     derived from the first successful syntax-gate dogfood (replace_symbol dropped
     #     an argparse line whose Namespace attr was still read → --agentic crashed,
     #     with no signal at edit time). ----------------------------------------------
     "edit_drift_warn": Lever(
@@ -178,7 +178,7 @@ LEVERS: dict[str, Lever] = {
         "AttributeError shipped without a word).",
         "iter7"),
 
-    # --- iter-8: the validate-before-write choke point, from the lydia
+    # --- group "iter8": the validate-before-write choke point, from the lydia
     #     teardown + the two-corpus trace sweep (320 dogfood sessions / 304 benchmark
     #     trajectories): broken code LANDED 4x more often than it was rejected, 51/55
     #     benchmark landings came through warn-only write, and non-Python files had no
@@ -201,7 +201,7 @@ LEVERS: dict[str, Lever] = {
     "broken_streak_steer": Lever(
         "After 2+ consecutive landed mutations that leave a Python file unparseable "
         "(the sanctioned already-broken path), the parse warning escalates to a "
-        "whole-file-rewrite / restore-known-good steer. The 079 dogfood sweep measured "
+        "whole-file-rewrite / restore-known-good steer. The dogfood sweep measured "
         "a 14-landing broken streak that plain per-edit warnings never interrupted.",
         "iter8"),
     "write_diff_note": Lever(
@@ -210,8 +210,8 @@ LEVERS: dict[str, Lever] = {
         "idea; targets the lost-track-of-file-state no-op/loop episodes.",
         "iter8"),
 
-    # --- (TB2 deadline awareness): the adapter now passes the wall budget
-    #     down (--turn-budget-s = cap-60), so the governor arms on every TB2 run. This
+    # --- group "iter9" (deadline awareness): the adapter passes the wall budget
+    #     down (CHAD_TURN_BUDGET_S = cap-60), so the governor arms on every run. This
     #     lever is the wrap-up NUDGE that rides on top of it. -------------------------
     "wrapup_window": Lever(
         "One-shot wall-clock steering note in the turn's final stretch (remaining <= "
@@ -222,7 +222,7 @@ LEVERS: dict[str, Lever] = {
         "governor (CHAD_NO_GOVERNOR).",
         "iter9"),
 
-    # --- (TB2 think-spiral salvage): close-and-continue force-closes a runaway
+    # --- Think-spiral salvage: close-and-continue force-closes a runaway
     #     <think> at CHAD_THINK_CEILING and keeps decoding the action in-step (the engine
     #     mechanism, env-gated, has no lever — off by default like CHAD_THINK_BUDGET). This
     #     lever is the ESCALATION on top of it. --------------------------------------
@@ -234,7 +234,7 @@ LEVERS: dict[str, Lever] = {
         "ceiling is armed (CHAD_THINK_CEILING), so default chad is unaffected.",
         "iter9"),
 
-    # --- (TB2.1 done-audit): the n=1 autopsy's largest fail bucket (20/43)
+    # --- Done-audit: the largest measured fail bucket (20/43)
     #     was dones claiming SPECIFIC verification the hidden checker rejected — the
     #     model verifies a WEAKER predicate than the task's own wording, with huge
     #     unused budget (kv-store-grpc done at 84s of 900), and done_spec_recheck was
@@ -260,7 +260,7 @@ LEVERS: dict[str, Lever] = {
         "THROTTLE once spent — one forced no-think action step per 3k further think "
         "tokens (guardrails.turn_think_throttle), so thinking restores when the model "
         "stops over-spending; a blanket rest-of-turn mute regressed run1 passes with "
-        "garbled no-think tails (plan 107). Acts only at step boundaries on fresh "
+        "garbled no-think tails. Acts only at step boundaries on fresh "
         "generations, never an in-flight one (086's lesson). Off in plan mode, for "
         "read-only-intent turns, and below a 300s wall budget (short relaunch tails "
         "belong to hard_wrapup). Only active with a wall budget configured.",
@@ -277,7 +277,7 @@ LEVERS: dict[str, Lever] = {
         "Only active with a wall budget configured; inert in interactive/unmetered runs.",
         "iter12"),
 
-    # --- iter-13: lever *interactions*. Two otherwise-winnable tasks were lost not
+    # --- group "iter13": lever *interactions*. Two otherwise-winnable tasks were lost not
     #     to the model but to guardrails fighting each other — a garbled tool
     #     call accepted as the final answer once the shared nudge counter and the
     #     done-audit latch were both spent, and the investigation gate counting a
@@ -309,7 +309,7 @@ LEVERS: dict[str, Lever] = {
         "harassing ops-heavy tasks that legitimately run many non-read commands.",
         "iter13"),
 
-    # --- iter-14: tool-result economics (2026-07). Two ideas from a teardown of a
+    # --- group "iter14": tool-result economics (2026-07). Two ideas from a teardown of a
     #     token-optimizing agent harness: normalize typographic unicode when matching
     #     edits, and never re-send file content the model provably already has; both
     #     map cleanly onto a prefill-dominated local loop. ---------------------------
@@ -338,7 +338,7 @@ LEVERS: dict[str, Lever] = {
         "still in context. OFF re-appends duplicate output verbatim.",
         "iter14"),
 
-    # --- iter-15: the audit-silent early-quit class. The no-empty-diff hard stop
+    # --- group "iter15": the audit-silent early-quit class. The no-empty-diff hard stop
     #     sits ABOVE the done-audit in both accept paths, so a done with no
     #     landed+verified change ends the turn before the audit can engage: a
     #     progress note carrying the model's own completion claim gets banked, and

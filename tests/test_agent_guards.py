@@ -17,7 +17,7 @@ characterizes them: the done-gating predicate, the tool-result bookkeeping
 repeated-call loop guard, and the no-tool-call nudge selection. The predicates are
 imported from `guardrails` (their real home).
 
-Run: `uv run python test_agent_guards.py`
+Run: `uv run python tests/test_agent_guards.py`
 """
 
 from chad.guardrails import (
@@ -729,7 +729,7 @@ def test_progress_note():
               + '<tool_call>{"name": "read", "arguments": {"path": "z.py"}}</tool_call>'}]
     ln = progress_note(loopy)
     check("degenerate reasoning not carried as hypothesis", "hypothesis" not in ln.lower(), ln)
-    # Rejected-completion-claim path (plan 107 follow-up — the build-pov-ray poisoning
+    # Rejected-completion-claim path (the long-build poisoning
     # loop: the banked note carried "the build is already complete and verified" as its
     # leading hypothesis, and all 6 relaunches re-confirmed it and re-done'd).
     poisoned = [
@@ -1085,7 +1085,7 @@ def test_classify_sync_kind():
 
     # The openai backend used to report usage.prompt_tokens (the FULL prompt)
     # where the contract says NEW-tokens-only, inflating prev_total and mis-tagging a
-    # perfectly-appending server session as 'warm-reload' on nearly every TB2 step.
+    # perfectly-appending server session as 'warm-reload' on nearly every benchmark step.
     # These sequences simulate the agent's accumulation (prev_total = cached + new + gen)
     # under BOTH semantics to pin the fixed behavior.
 
@@ -1166,7 +1166,7 @@ if __name__ == "__main__":
 
 
 def test_dup_result_elide():
-    # iter-14: a read-only result byte-identical to a tool message
+    # A read-only result byte-identical to a tool message
     # still in the transcript is elided to a short pointer; anything that breaks
     # byte-equality (changed file, different args, compaction rewrite) flows through.
     from chad.guardrails import DUP_ELIDE_MIN_CHARS, elide_duplicate_result
@@ -1203,7 +1203,7 @@ def test_dup_result_elide_lever_off(monkeypatch):
 
 
 def test_subagent_evidence_warning():
-    # iter-14: a confident report with zero tool dispatches is the answered-from-memory
+    # A confident report with zero tool dispatches is the answered-from-memory
     # tell; it gets a verify warning appended. Real work, failure sentinels (the salvage
     # path owns those), and empty results are left alone.
     from chad.guardrails import SUBAGENT_EVIDENCE_WARNING, subagent_evidence_warning

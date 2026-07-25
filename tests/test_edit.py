@@ -4,7 +4,7 @@ Each case is a real weak-model edit miss from the dogfooding logs (~1 in 6 edits
 literal "\\n" in `old`, indentation drift) or a SAFETY case (an ambiguous or wrong `old`
 must NOT change the file). Pure + fast — no model load.
 
-Run: `uv run python test_edit.py`
+Run: `uv run python tests/test_edit.py`
 """
 
 import os
@@ -148,7 +148,7 @@ def test_indent_break_is_rejected_and_reverted():
 
 def test_non_indent_break_rejected(monkeypatch):
     """(supersedes the warn-only scope): a NON-indentation syntax
-    break (unclosed paren) is also REVERTED. The 073 dogfood measured what warn-only
+    break (unclosed paren) is also REVERTED. Dogfooding measured what warn-only
     costs a small model: ten ignored "no longer parses" warnings while stale line edits
     compounded on a severed def signature, ending in LOOP ABORT with the file broken.
     Multi-step changes that must pass through a broken state route through `write`
@@ -248,7 +248,7 @@ if __name__ == "__main__":
 
 
 def test_typo_recovery_file_has_unicode_model_sends_ascii():
-    # iter-14: file uses typographic punctuation, the model
+    # File uses typographic punctuation, the model
     # re-types it ASCII-fied. Rungs 1-3 miss; the typo-normalized rung must land.
     before = 'MSG = "cache — warm start"\nprint(MSG)\n'
     res, after = run(before, 'MSG = "cache - warm start"', 'MSG = "cache - hot start"')

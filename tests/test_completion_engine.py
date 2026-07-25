@@ -196,7 +196,7 @@ def test_client_error_chunk_is_not_transient():
 def test_server_error_chunk_is_transient():
     """llama.cpp answers 500 'does not match the expected Content-only format' when its
     chat parser can't reconcile a completion. That is sampling-dependent, so the agent is
-    allowed to re-roll it (TB2 make-mips-interpreter died on exactly this)."""
+    allowed to re-roll it (a benchmark task died on exactly this)."""
     import pytest
 
     from chad.base_engine import BackendError

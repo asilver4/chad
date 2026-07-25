@@ -4,6 +4,37 @@ Notable, user-visible changes.
 
 ## Unreleased
 
+- **24 GB Macs now get the 35B.** The 35B's floor was 32 GB because its working set
+  SIGKILLed a 24 GB machine mid-turn. The fused attention kernel and the
+  8-bit-from-the-start KV cache it enables cut the per-token cache cost enough to give the
+  headroom back, and the compaction trigger sizes itself from the live Metal budget rather
+  than a fixed constant, so a tight box narrows its window instead of dying. 16/18 GB
+  still get the 9B, and `--model 9b` puts a 24 GB box back on the small model.
+- **`--model` replaces reaching for an env var to change model.** Takes `35b`, `9b`,
+  `auto`, or any Hugging Face repo id / local model dir; works on `chad` and `chad serve`.
+  `CHAD_MODEL` still works and the flag outranks it, so a globally exported var can't pin
+  every run.
+- **`serve`, `prove` and `levers` are real subcommands** with their own `--help`. They
+  were dispatched on the literal task string, so `chad --help` never mentioned them while
+  still listing `--host`/`--port` as "`chad serve` only" — flags that parsed fine and were
+  then silently ignored on every other invocation. `--host`/`--port` now belong to
+  `chad serve` and are rejected elsewhere. `chad --levers` still works as an alias.
+- **`chad --help` lists 12 flags instead of 19.** The unattended-run governor knobs
+  (`--think-ceiling`, `--turn-budget-tokens`, `--turn-budget-s`, `--auto-continue`,
+  `--review-pass`) are set by benchmark harnesses, never by hand, and every one already
+  had a `CHAD_*` twin, so the flags are **removed** rather than hidden — passing one is now
+  an error instead of a silent no-op. `CHAD_AUTO_CONTINUE` fills in the one twin that was
+  missing, and the bundled TB2 adapter (`benchmarks/tb2/harbor_chad_tb2.py`) sets all three
+  it used through the `CHAD_*` env dict it was already building. `--think-budget` stays on
+  the CLI: unlike the rest it is a capability trade a person reaches for interactively.
+- **A dead remote backend explains itself.** An unreachable `--base-url` exited through a
+  22-line traceback ending in `chad.base_engine.BackendError`, which reads as a chad crash
+  rather than "the server you pointed me at isn't up". Now problem/cause/fix, like the
+  model-load and download failures.
+- **Removed the draft-model code path.** chad has been single-model since before 1.0;
+  `Engine(draft_id=...)` was never set by any caller, but its branches still shaped cache
+  construction, KV-quant resolution, warm-prefix eligibility and prefill. Prompt-lookup
+  decoding is unaffected — it shares the word "draft" and none of the machinery.
 - **`chad serve` — drive the local MLX model from a Linux container.** chad's remote arm
   (`--backend llama`) exists because MLX can't run in a benchmark container, which in
   practice meant measuring a *different quantization* of the model on a remote GPU box.
