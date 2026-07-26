@@ -258,8 +258,8 @@ def build_system_prompt(model_id: str | None = None) -> str:
     # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
     # below, where re-prefilling a few hundred tokens is cheap. The profile block is
     # static for a given model, so it sits above the boundary with the base prompt.
-    return (_BASE_PROMPT + _bash_bg_block() + profiles.prompt_block(model_id)
-            + "\n".join(_dynamic_context()))
+    return (_BASE_PROMPT + _bash_bg_block() + _verify_specific_block()
+            + profiles.prompt_block(model_id) + "\n".join(_dynamic_context()))
 
 
 def _bash_bg_block() -> str:
@@ -273,6 +273,24 @@ def _bash_bg_block() -> str:
             "running and its output streams to a file named in the result. Read or "
             "grep that file to check on it, and do other work while it runs — never "
             "sit in a loop re-reading it.\n")
+
+
+def _verify_specific_block() -> str:
+    """Steer the final verification at the task's OWN stated check instead of a proxy.
+    The measured class: trials that re-verified after a done bounce with a weaker check
+    than the task named (file-exists for a content requirement, a hand-rolled probe for
+    a stated test command) and shipped a wrong solution with most of the wall unused.
+    Static for the session, so it sits above the cache boundary."""
+    from . import levers
+    if not levers.enabled("steer_verify_specific"):
+        return ""
+    return ("\n- When the task states its own acceptance check (an exact command, a "
+            "test, a required output), your final verification must RUN that stated "
+            "check and read its output — not a stand-in. WRONG: `ls /app/out.json` "
+            "then done (existence proves nothing about contents). CORRECT: run the "
+            "command the task names end-to-end, confirm the output matches every "
+            "stated requirement, then call done. If a done was rejected with quoted "
+            "requirement lines, re-run the exact check those lines describe.\n")
 
 
 def build_subagent_prompt(model_id: str | None = None) -> str:

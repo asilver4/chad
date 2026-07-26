@@ -370,6 +370,40 @@ LEVERS: dict[str, Lever] = {
         "signalled; a user interrupt still kills outright. OFF restores the "
         "kill-and-advise path exactly.",
         "iter15"),
+    "steer_verify_specific": Lever(
+        "One system-prompt block steering the FINAL verification at the task's own "
+        "stated acceptance check (run the named command/test end-to-end and read its "
+        "output) instead of a proxy like file-existence or grep-counting, with a "
+        "WRONG/CORRECT pair. The measured class: of 42 failed trials that took a "
+        "done-audit bounce, 38 did re-verify afterwards — with a weaker or wrong "
+        "check — and still shipped a bad solution, most with over 80% of the wall "
+        "unused; a harness-side predicate cannot judge check quality (plan-112(b) "
+        "closed), so this steers the choice upstream where it is made. Rides the "
+        "cached prefix; OFF removes the block byte-exactly.",
+        "iter15"),
+    "scoped_destructive_guard": Lever(
+        "Scope the destructive-bash seatbelt's recursive-rm screen to targets whose "
+        "loss is actually catastrophic — filesystem root, top-level directories, "
+        "home trees at any depth, whole-cwd/parent globs — instead of ANY absolute "
+        "path, and have the headless block tell the model the guard (not a person) "
+        "refused and how to narrow the delete. In a container every real path is "
+        "absolute, so the legacy shape denied ordinary scoped deletes "
+        "(`rm -rf /tmp/test-deploy`) as '[denied by user]' — the measured cost: 152 "
+        "denials across 26 trials, one turn re-phrasing the same delete 30 times. "
+        "Also screens every rm target in a compound command, not just the first "
+        "(a strictly wider net than legacy on multi-target commands). mkfs / "
+        "dd-to-device / fork-bomb / curl|sh screens are untouched. OFF restores the "
+        "any-absolute-path shape and the bare denial text.",
+        "iter15"),
+    "late_continue_replenish": Lever(
+        "Keep granting auto-continue relaunches beyond the base allowance while a "
+        "QUARTER of the task wall remains, instead of half. Step-capped turns that "
+        "kept working but never landed a verified change ended their task with "
+        "12-50% of the wall budget stranded once the 0.5 replenish line passed — "
+        "attempts the wall could still have paid for. The absolute relaunch ceiling "
+        "(6) and the minimum-remaining-wall floor for any relaunch are unchanged. "
+        "OFF restores the 0.5 threshold exactly.",
+        "iter15"),
     "capped_think_credit": Lever(
         "Credit a generation that ended inside <think> — no closing tag, whatever "
         "stopped it — as reasoning in full, not zero. The turn think budget only "

@@ -775,6 +775,40 @@ def test_workspace_map_bite(monkeypatch):
     assert "# Workspace map" not in p and "# Workspace files" in p
 
 
+# === iter15: destructive-guard scoping + late continue replenish ===========
+
+def test_steer_verify_specific(monkeypatch):
+    """The verify-the-stated-check block appears in the system prompt with the lever
+    on and vanishes byte-exactly with it off."""
+    from chad import prompt
+    n = bite("steer_verify_specific")
+    on(monkeypatch)
+    assert "your final verification must RUN that stated" in prompt.build_system_prompt("ornith")
+    off(monkeypatch, n)
+    assert "your final verification must RUN that stated" not in prompt.build_system_prompt("ornith")
+
+
+def test_scoped_destructive_guard(monkeypatch):
+    """A recursive delete of a deep absolute path (a scoped container cleanup) passes
+    with the lever on; ablated, the legacy any-absolute-path shape denies it again."""
+    n = bite("scoped_destructive_guard")
+    on(monkeypatch)
+    assert not guardrails.is_destructive_bash("rm -rf /tmp/test-deploy")
+    assert guardrails.is_destructive_bash("rm -rf /home/user/project")
+    off(monkeypatch, n)
+    assert guardrails.is_destructive_bash("rm -rf /tmp/test-deploy")
+
+
+def test_late_continue_replenish(monkeypatch):
+    """With 44% of the wall remaining an extra continue is granted on (past the legacy
+    half-wall line), and refused with the lever off."""
+    n = bite("late_continue_replenish")
+    on(monkeypatch)
+    assert guardrails.replenish_continue(900, 500, 2) is True
+    off(monkeypatch, n)
+    assert guardrails.replenish_continue(900, 500, 2) is False
+
+
 # === the coverage contract =================================================
 
 def test_every_registered_lever_has_a_bite_test():

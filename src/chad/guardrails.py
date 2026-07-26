@@ -57,10 +57,6 @@ def _announces_unfulfilled_action(stripped: str) -> bool:
 # CHAD_NO_DESTRUCTIVE_GUARD=1 to disable. NOT a security boundary — a sandbox is —
 # just a seatbelt against the obvious catastrophe.
 _DESTRUCTIVE_BASH = (
-    # recursive force-rm whose target is rooted at / or ~ or $HOME (any depth), or
-    # is a bare `*` / `.` (whole-cwd). A relative path like `build/` or `./out` is
-    # NOT matched — only roots and home subtrees, where an injected delete is fatal.
-    re.compile(r"\brm\s+(?:-\w+\s+)*-\w*[rR]\w*\s+(?:-\w+\s+)*(?:[/~]\S*|\$HOME\S*|[.*](?:\s|$))"),
     re.compile(r"\b(mkfs|fdisk|parted)\b"),
     re.compile(r"\bdd\b[^\n]*\bof=/dev/"),
     re.compile(r">\s*/dev/(sd|disk|nvme|hd)"),
@@ -68,11 +64,65 @@ _DESTRUCTIVE_BASH = (
     re.compile(r"\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba)?sh\b"),  # curl … | sh
 )
 
+# Legacy recursive-rm shape (lever OFF): any absolute path, ~ or $HOME (any depth), or
+# a bare `*` / `.`. In a headless container run every real path IS absolute, so this
+# denied ordinary scoped deletes like `rm -rf /tmp/test-deploy` — the measured cost.
+_RM_LEGACY = re.compile(
+    r"\brm\s+(?:-\w+\s+)*-\w*[rR]\w*\s+(?:-\w+\s+)*(?:[/~]\S*|\$HOME\S*|[.*](?:\s|$))")
+
+# One rm invocation and its argument span (stops at a command separator, so each rm in
+# a compound command is screened on its own targets).
+_RM_CALL = re.compile(r"\brm\s+([^;&|\n]*)")
+_RM_RECURSIVE_FLAG = re.compile(r"^-\w*[rR]|^--recursive$")
+
+
+def _rm_target_protected(tok: str) -> bool:
+    """A recursive-rm target whose loss is catastrophic rather than scoped: the
+    filesystem root, any top-level directory (`/etc`, `/usr`, `/*` …), a home tree at
+    any depth (`~…`, `$HOME…`, `/home/…`, `/Users/…`, `/root…`), the whole cwd or its
+    parent (`.`, `..`, `*`), or a glob that empties a top-level directory (`/app/*`).
+    Deeper absolute paths (`/tmp/test-deploy`, `/app/c4_resharded`) are scoped deletes,
+    not catastrophes — the guard must not eat them."""
+    tok = tok.strip("'\"")
+    if not tok:
+        return False
+    if tok in ("*", ".", "..", "./"):
+        return True
+    if tok.startswith(("~", "$HOME", "${HOME}")):
+        return True
+    if not tok.startswith("/"):
+        return False
+    segs = tok[1:].rstrip("/").split("/")
+    if segs == [""] or len(segs) == 1:          # "/" itself or depth-1 (/etc, /*)
+        return True
+    if segs[0] in ("home", "Users", "root"):    # home trees, any depth
+        return True
+    return len(segs) == 2 and segs[1] == "*"    # /app/* — empties a top-level dir
+
+
+def _rm_hits_protected(command: str) -> bool:
+    """Scoped recursive-rm screen (lever ON): checks EVERY target of every rm in the
+    command (the legacy single-target regex only saw the first)."""
+    for m in _RM_CALL.finditer(command):
+        toks = m.group(1).split()
+        if not any(_RM_RECURSIVE_FLAG.match(t) for t in toks if t.startswith("-")):
+            continue
+        if any(_rm_target_protected(t) for t in toks if not t.startswith("-")):
+            return True
+    return False
+
 
 def is_destructive_bash(command: str) -> bool:
-    """True if a bash command matches the catastrophic denylist (see _DESTRUCTIVE_BASH).
-    Pure and testable. Caller decides what to do (force-confirm / block)."""
-    return any(p.search(command) for p in _DESTRUCTIVE_BASH)
+    """True if a bash command matches the catastrophic denylist. Pure and testable.
+    Caller decides what to do (force-confirm / block). Non-rm shapes (mkfs, dd-to-
+    device, fork bomb, curl|sh) are always screened; the recursive-rm screen is
+    target-scoped under `scoped_destructive_guard` (see _rm_target_protected) and
+    the any-absolute-path legacy shape with the lever off."""
+    if any(p.search(command) for p in _DESTRUCTIVE_BASH):
+        return True
+    if levers.enabled("scoped_destructive_guard"):
+        return _rm_hits_protected(command)
+    return bool(_RM_LEGACY.search(command))
 
 
 # A shell command that proves NOTHING about runtime behavior — a syntax/compile check,
@@ -1285,22 +1335,32 @@ def relaunch_budget(total_wall_s, task_elapsed_s) -> float | None:
 AUTO_CONTINUE_TOTAL_CAP = 6       # absolute relaunch ceiling per task (base + extras)
 AUTO_CONTINUE_REPLENISH_FRAC = 0.5  # grant extras only while this fraction of the task
                                     # wall is still unspent
+AUTO_CONTINUE_REPLENISH_FRAC_LATE = 0.25  # late_continue_replenish: keep granting down
+                                          # to a quarter of the wall remaining
 
 
 def replenish_continue(total_wall_s, elapsed_s, used_continues,
                        cap: int = AUTO_CONTINUE_TOTAL_CAP,
-                       frac: float = AUTO_CONTINUE_REPLENISH_FRAC) -> bool:
+                       frac: float | None = None) -> bool:
     """Grant an auto-continue relaunch beyond the base allowance? The fixed base of 2
     is wall-blind: a long build task burned 3 step-capped turns in 637s and gave up
     with 94.7% of a 12000s budget still unused. While more than
     `frac` of the task wall remains unspent, keep granting fresh attempts, bounded by
     `cap` total relaunches so a pathological fast-stall loop still terminates well
     before the harness SIGKILL. No wall budget -> never (interactive runs keep the
-    explicit base allowance only). Pure/testable; the caller counts usage."""
+    explicit base allowance only). `frac=None` resolves the threshold from the
+    `late_continue_replenish` lever: 0.25 with it on (the measured stranding — step-
+    capped trials ended with 12-50% of wall unspent because extras stopped at the 0.5
+    line), 0.5 with it off. `relaunch_budget`'s MIN_RELAUNCH_WALL_S floor still vetoes
+    a relaunch too close to the deadline. Pure/testable; the caller counts usage."""
     if not total_wall_s:
         return False
     if used_continues >= cap:
         return False
+    if frac is None:
+        frac = (AUTO_CONTINUE_REPLENISH_FRAC_LATE
+                if levers.enabled("late_continue_replenish")
+                else AUTO_CONTINUE_REPLENISH_FRAC)
     return (total_wall_s - elapsed_s) > frac * total_wall_s
 
 

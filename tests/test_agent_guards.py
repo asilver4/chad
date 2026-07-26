@@ -492,6 +492,54 @@ def test_destructive_bash_guard():
         check(f"safe does NOT fire: {cmd!r}", not is_destructive_bash(cmd))
 
 
+def test_destructive_guard_scoped_rm():
+    import os
+    # scoped_destructive_guard ON (default): a recursive delete of a DEEP absolute
+    # path is a scoped delete, not a catastrophe — the measured false-positive class
+    # (152 '[denied by user]' results across 26 container trials, every real path
+    # absolute; one turn re-phrased the same /tmp cleanup 30 times).
+    for cmd in [
+        "rm -rf /tmp/test-deploy",
+        "rm -rf /app/c4_resharded && ls /app",
+        "rm -rf /tmp/vrepo /tmp/run_verify.sh /tmp/full_verify.sh",
+        "rm -rf /var/www/html/dev/cache",
+        "rm -rf /opt/build/output/*",
+    ]:
+        check(f"scoped delete allowed: {cmd!r}", not is_destructive_bash(cmd))
+
+    # Catastrophic targets still fire: roots, depth-1, home trees, cwd/parent, and a
+    # glob that empties a top-level dir.
+    for cmd in [
+        "rm -rf /etc",
+        "rm -rf /usr/",
+        "rm -rf /home/user/project",
+        "rm -rf /Users/nate/repo",
+        "rm -rf /root/.ssh",
+        "rm -rf /app/*",
+        "rm -rf ..",
+        "rm -rf ${HOME}/x",
+    ]:
+        check(f"protected target fires: {cmd!r}", is_destructive_bash(cmd))
+
+    # Every target of every rm is screened — legacy's single-target regex saw only
+    # the first token and missed a protected one hiding behind a safe one.
+    check("second target / fires", is_destructive_bash("rm -rf /tmp/x /"))
+    check("rm after separator fires",
+          is_destructive_bash("rm -rf /tmp/x; rm -rf /etc"))
+    # A recursive flag on one rm must not condemn a different, non-recursive rm.
+    check("non-recursive rm of / does not fire (no -r)",
+          not is_destructive_bash("rm -f /tmp/x"))
+
+    # Lever OFF restores the legacy any-absolute-path shape exactly.
+    os.environ["CHAD_DISABLE"] = "scoped_destructive_guard"
+    try:
+        check("lever OFF: /tmp delete fires again",
+              is_destructive_bash("rm -rf /tmp/test-deploy"))
+        check("lever OFF: home still fires", is_destructive_bash("rm -rf ~"))
+    finally:
+        del os.environ["CHAD_DISABLE"]
+
+
 def test_think_budget():
     # Soft think-cap escalation ramp. stuck_level 0 => base (cheap default).
     check("stuck 0 => base", think_budget(0) == 512, think_budget(0))
@@ -1046,13 +1094,31 @@ def test_turn_think_throttle():
 
 
 def test_replenish_continue():
-    # More than half the wall unspent and under the cap -> grant.
+    import os
+    # More than half the wall unspent and under the cap -> grant (either lever state).
     check("early giveup, wall mostly unspent -> grant",
           replenish_continue(12000, 637, 2) is True)
-    # Past the half-wall point -> no extras (the endgame belongs to wrap-up/landing).
-    check("more than half spent -> no grant", replenish_continue(900, 500, 2) is False)
-    # Exactly at the boundary is NOT more-than -> no grant.
-    check("exact half boundary -> no grant", replenish_continue(1000, 500, 2) is False)
+    # late_continue_replenish ON (default): extras keep flowing down to the quarter-
+    # wall line — the measured stranding was step-capped tasks ending with 12-50% of
+    # wall unspent once the old half-wall line passed.
+    check("44% remaining -> grant (late replenish)",
+          replenish_continue(900, 500, 2) is True)
+    check("30% remaining -> grant (late replenish)",
+          replenish_continue(1000, 700, 2) is True)
+    # Exactly at the quarter boundary is NOT more-than -> no grant.
+    check("exact quarter boundary -> no grant", replenish_continue(1000, 750, 2) is False)
+    check("under a quarter left -> no grant", replenish_continue(1000, 800, 2) is False)
+    # Lever OFF restores the half-wall threshold exactly.
+    os.environ["CHAD_DISABLE"] = "late_continue_replenish"
+    try:
+        check("lever OFF: more than half spent -> no grant",
+              replenish_continue(900, 500, 2) is False)
+        check("lever OFF: exact half boundary -> no grant",
+              replenish_continue(1000, 500, 2) is False)
+    finally:
+        del os.environ["CHAD_DISABLE"]
+    # An explicit frac bypasses the lever entirely (pure-parameter callers).
+    check("explicit frac honored", replenish_continue(1000, 700, 2, frac=0.5) is False)
     # Absolute cap: never more than AUTO_CONTINUE_TOTAL_CAP total relaunches.
     check("at the total cap -> no grant", replenish_continue(12000, 100, 6) is False)
     check("just under the cap -> grant", replenish_continue(12000, 100, 5) is True)

@@ -373,6 +373,7 @@ class Agent:
         # a transcript whose protected floor exceeds ctx_limit isn't re-compacted —
         # and its warm prefix cache destroyed — on every single step.
         self._compact_state: dict = {}
+        self._deny_reason: str | None = None  # headless guard-block explanation for the model
         # Live ctx-limit recheck: the startup limit was computed on
         # an idle box; Docker/harbor spinning up mid-session changes what's safe.
         # Called at the top of each turn; only a >10% move is applied (hysteresis).
@@ -597,6 +598,17 @@ class Agent:
             if self._confirm_cb is None and not sys.stdin.isatty():
                 self._emit("info", f"  [blocked destructive command in auto mode: "
                                    f"{args.get('command', '')!r}; set CHAD_NO_DESTRUCTIVE_GUARD=1 to allow]")
+                # Tell the MODEL the truth about who blocked it and why: "[denied by
+                # user]" reads as a human refusal and teaches the wrong lesson (the
+                # measured trace: a model re-phrasing the same delete 30 times). The
+                # guard names itself and the fix — narrow the target.
+                if levers.enabled("scoped_destructive_guard"):
+                    self._deny_reason = (
+                        "[blocked by the destructive-command guard, not by a person: "
+                        "the command matches a catastrophic pattern (recursive delete "
+                        "of a filesystem root, top-level directory, or home tree — or "
+                        "mkfs / dd-to-device / curl|sh). Re-issue it with a narrower "
+                        "target (a specific subdirectory), or skip the deletion.]")
                 return False
         if self._confirm_cb is not None:
             return self._confirm_cb(name, args)
@@ -1897,8 +1909,11 @@ class Agent:
                               "plan to ./plans/NNN-title.md.]")
                 elif not plan_write and not self._confirm(name, args):
                     # A plan write is the expected action in plan mode, so it skips the
-                    # confirm prompt; everything else still goes through _confirm.
-                    result = "[denied by user]"
+                    # confirm prompt; everything else still goes through _confirm. A
+                    # genuine human "no" stays "[denied by user]"; the headless guard
+                    # block carries its own explanation (set in _confirm).
+                    result = self._deny_reason or "[denied by user]"
+                    self._deny_reason = None
                 else:
                     _t0 = time.perf_counter()
                     self.tool_dispatches += 1
