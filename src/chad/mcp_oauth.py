@@ -18,11 +18,13 @@ Everything here is gated by the `CHAD_MCP_OAUTH` feature flag (see `oauth_enable
 With the flag off, an `auth: oauth` server is skipped with a warning and the
 stdio/bearer/HTTP paths are unchanged — none of this code runs.
 
-SDK API confirmed against **mcp==1.28.1** (`mcp.__version__` does not exist; use
+SDK API confirmed against **mcp==2.0.0** (`mcp.__version__` does not exist; use
 `importlib.metadata.version("mcp")`):
   - `from mcp.client.auth import OAuthClientProvider, TokenStorage`
   - `OAuthClientProvider(server_url, client_metadata, storage, redirect_handler,
-     callback_handler, timeout=300.0, client_metadata_url=None)`
+     callback_handler, client_metadata_url=None, validate_resource_url=None)`
+  - `callback_handler` returns `AuthorizationCodeResult` (mcp.shared.auth; fields
+    code/state/iss) — the 1.x `(code, state)` tuple form is gone.
   - `TokenStorage` is a 4-method **async** protocol:
         get_tokens()       -> OAuthToken | None
         set_tokens(tokens) -> None
@@ -30,13 +32,12 @@ SDK API confirmed against **mcp==1.28.1** (`mcp.__version__` does not exist; use
         set_client_info(client_info) -> None
   - models live in `mcp.shared.auth`: `OAuthClientMetadata` (only `redirect_uris`
     is required), `OAuthToken` (`access_token` required), `OAuthClientInformationFull`.
-  - `OAuthClientProvider` is an `httpx.Auth`; Dynamic Client Registration is performed
+  - `OAuthClientProvider` is an `httpx2.Auth`; Dynamic Client Registration is performed
     internally during its auth flow when the server advertises a registration endpoint
     and no client_info is stored (so we never hand-roll DCR).
-  - `streamablehttp_client(url, headers=..., auth=<provider>)` accepts the provider —
-    this is exactly why chad keeps the deprecated `streamablehttp_client` (the
-    newer `streamable_http_client` has no `auth=`).
-No divergence from the assumed API was found.
+  - the provider goes into `create_mcp_http_client(headers=..., auth=<provider>)`,
+    whose client feeds `streamable_http_client(url, http_client=...)` (see mcp.py).
+No further divergence from the assumed API was found.
 
 NOTE / e2e gap: a full 3-legged OAuth handshake against a real authorization server is
 NOT exercised in tests (there is no real IdP in CI). The seams are tested — token-store
@@ -53,12 +54,26 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import anyio
-from mcp.client.auth import OAuthClientProvider
-from mcp.shared.auth import (
-    OAuthClientInformationFull,
-    OAuthClientMetadata,
-    OAuthToken,
-)
+
+# Guarded like the transport import in mcp.py, and for the same reason: this module is
+# imported at `chad.mcp` import time, which happens on every Agent construction, so an
+# SDK that moved these symbols would be a traceback on startup rather than a degraded
+# feature. With the SDK unusable `oauth_enabled()` reports False and no OAuth code path
+# is ever entered — the same shape as the operator leaving the flag off.
+try:
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.shared.auth import (
+        AuthorizationCodeResult,
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
+    _SDK_ERROR: "str | None" = None
+except Exception as _e:  # noqa: BLE001 — any import-time failure, not just ImportError
+    OAuthClientProvider = AuthorizationCodeResult = None          # type: ignore[assignment,misc]
+    OAuthClientInformationFull = OAuthClientMetadata = None       # type: ignore[assignment,misc]
+    OAuthToken = None                                             # type: ignore[assignment,misc]
+    _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
 from .diag import log
 
@@ -76,7 +91,12 @@ _POLL = 1.0
 
 def oauth_enabled() -> bool:
     """True only when the operator has opted into OAuth via `CHAD_MCP_OAUTH`. With this
-    off, no OAuth code runs and the stdio/bearer/HTTP paths are unaffected."""
+    off, no OAuth code runs and the stdio/bearer/HTTP paths are unaffected. An SDK whose
+    auth symbols we couldn't import reads as off, so the callers' existing "OAuth
+    unavailable" path handles it — nothing here can raise."""
+    if _SDK_ERROR:
+        log.warning("mcp: OAuth unavailable, SDK auth import failed: %s", _SDK_ERROR)
+        return False
     val = os.environ.get("CHAD_MCP_OAUTH", "")
     return val.strip().lower() not in ("", "0", "false", "no", "off")
 
@@ -311,14 +331,15 @@ def make_login_provider(server_url: str, storage: "FileTokenStorage",
             say("No browser available. Open this URL to approve access:")
         say(auth_url)
 
-    async def callback_handler() -> "tuple[str, str | None]":
+    async def callback_handler() -> "AuthorizationCodeResult":
         res = await anyio.to_thread.run_sync(loopback.wait, timeout)
         if res is None:
             raise TimeoutError(f"OAuth login timed out after {int(timeout)}s")
         code, state = res
         if not code:
             raise RuntimeError("OAuth login did not return an authorization code")
-        return code, state
+        # mcp 2.x: a typed result, not the 1.x (code, state) tuple
+        return AuthorizationCodeResult(code=code, state=state)
 
     return OAuthClientProvider(
         server_url=server_url,

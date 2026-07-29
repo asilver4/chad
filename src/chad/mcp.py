@@ -6,7 +6,7 @@ doesn't ship: a GitHub server, a Postgres server, Linear/Slack/Atlassian, a
 company's internal API, etc. This is the same extension mechanism Claude Code uses.
 
 Transport is provided by the official `mcp` Python SDK (`stdio_client` for local
-subprocess servers, `streamablehttp_client` for hosted HTTP servers). The SDK is
+subprocess servers, `streamable_http_client` for hosted HTTP servers). The SDK is
 **async (anyio)**; chad's tool layer is **synchronous and blocking**. The bridge is
 a single `anyio.from_thread.BlockingPortal` running one event loop in a background
 thread, owned by the registry for its lifetime. Each server's transport +
@@ -47,17 +47,33 @@ from typing import Any, Optional
 
 import anyio
 from anyio.from_thread import start_blocking_portal
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
-# `streamablehttp_client(url, headers=..., auth=...)` is the documented HTTP entry
-# point that takes headers (and, in , an `auth=` OAuth provider) directly,
-# building the httpx client via MCP's own factory with the right defaults. mcp 1.28.1
-# marks it deprecated in favour of `streamable_http_client(url, *, http_client=...)`,
-# but that variant has no `headers=`/`auth=` — you'd hand-build an httpx client and
-# risk dropping MCP's required client config — so we keep this one until the new API
-# grows an equivalent. (Confirmed against mcp==1.28.1.)
-from mcp.client.streamable_http import streamablehttp_client
+# The SDK import is GUARDED. Everything else in this module degrades when a server is
+# missing or broken; the one thing that used to take the whole process down was the SDK
+# itself changing shape underneath us — chad.mcp is imported unconditionally by Agent's
+# constructor, so an ImportError here is a traceback on `chad` with no way past it. (It
+# happened: mcp 2.0 removed `streamablehttp_client`.) The dep is capped in pyproject;
+# this is the backstop, so an incompatible SDK costs the operator their MCP tools and a
+# warning line instead of the agent. `_SDK_ERROR` is checked in `_Registry._connect`.
+#
+# mcp 2.x API: `streamable_http_client(url, *, http_client=...)` — the caller builds
+# and owns the httpx2 client. `create_mcp_http_client(headers=..., auth=...)` is MCP's
+# own factory with the required client defaults, so headers and the OAuth provider go
+# there (the 1.x `streamablehttp_client(url, headers=, auth=)` form is gone).
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    from mcp.client.streamable_http import (
+        create_mcp_http_client,
+        streamable_http_client,
+    )
+    from mcp.types import PaginatedRequestParams
+    _SDK_ERROR: Optional[str] = None
+except Exception as _e:  # noqa: BLE001 — any import-time failure, not just ImportError
+    ClientSession = StdioServerParameters = None    # type: ignore[assignment,misc]
+    stdio_client = streamable_http_client = None    # type: ignore[assignment]
+    create_mcp_http_client = PaginatedRequestParams = None  # type: ignore[assignment,misc]
+    _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
 from . import mcp_oauth
 from .diag import log, warn_footer
@@ -216,18 +232,32 @@ def _stdio_env(environ, extra) -> dict:
     return env
 
 
+def _http_transport(url: str, headers, auth):
+    """The mcp 2.x HTTP transport with the httpx2 client's lifecycle owned HERE:
+    `streamable_http_client` no longer takes headers=/auth= — they go into MCP's
+    own client factory — and no longer closes the client for us."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def open_transport():
+        async with create_mcp_http_client(headers=headers, auth=auth) as http_client:
+            async with streamable_http_client(url, http_client=http_client) as streams:
+                yield streams
+    return open_transport()
+
+
 def _transport_for(spec: dict, auth=None):
     """Return (kind, build) for a server spec, where `build()` is a zero-arg factory
     that yields the SDK transport async context manager. Transport is chosen by
     presence: `url` -> HTTP, else `command` -> stdio (`type` is advisory only).
-    `auth` is an optional OAuthClientProvider passed straight through to
-    `streamablehttp_client(..., auth=...)`; None keeps the static bearer/header path.
-    Returns (None, None) if neither is present."""
+    `auth` is an optional OAuthClientProvider handed to the httpx2 client factory;
+    None keeps the static bearer/header path. Returns (None, None) if neither is
+    present."""
     url = spec.get("url")
     if isinstance(url, str) and url:
         headers = spec.get("headers")
         headers = headers if isinstance(headers, dict) else None
-        return "http", lambda: streamablehttp_client(url, headers=headers, auth=auth)
+        return "http", lambda: _http_transport(url, headers, auth)
     command = spec.get("command")
     if isinstance(command, str) and command:
         env = _stdio_env(os.environ, spec.get("env"))
@@ -251,9 +281,10 @@ async def _list_all_tools(session: "ClientSession"):
     out = []
     cursor = None
     for _ in range(_MAX_LIST_PAGES):
-        result = await session.list_tools(cursor) if cursor else await session.list_tools()
+        params = PaginatedRequestParams(cursor=cursor) if cursor else None
+        result = await session.list_tools(params=params)
         out += [t for t in (result.tools or []) if getattr(t, "name", None)]
-        cursor = result.nextCursor
+        cursor = result.next_cursor
         if not cursor:
             break
     return out
@@ -299,7 +330,7 @@ async def _invoke(session: "ClientSession", raw: str, arguments: dict, timeout: 
 
 def _render_result(res) -> str:
     """Flatten an SDK `CallToolResult` into text for the model. Concatenates text
-    content blocks; notes non-text blocks (images/resources) by type. Honors isError
+    content blocks; notes non-text blocks (images/resources) by type. Honors is_error
     by prefixing the text so the model treats it as a failure to react to."""
     parts = []
     for block in (getattr(res, "content", None) or []):
@@ -317,8 +348,8 @@ def _render_result(res) -> str:
         else:
             parts.append(f"[{btype or 'non-text'} content omitted]")
     text = "\n".join(p for p in parts if p)
-    # Some servers return only structuredContent (no content blocks).
-    sc = getattr(res, "structuredContent", None)
+    # Some servers return only structured_content (no content blocks).
+    sc = getattr(res, "structured_content", None)
     if not text and sc is not None:
         try:
             text = json.dumps(sc, ensure_ascii=False, indent=2)
@@ -326,7 +357,10 @@ def _render_result(res) -> str:
             text = str(sc)
     if not text:
         text = "[no content]"
-    if getattr(res, "isError", False):
+    # `is_error` (was isError in mcp 1.x): a getattr on the OLD name would default
+    # False forever and tool-reported errors would silently stop being flagged —
+    # pinned by a test that fails on the 1.x spelling.
+    if getattr(res, "is_error", False):
         text = "[tool reported an error]\n" + text
     return text[:_RESULT_MAX_CHARS]
 
@@ -354,7 +388,7 @@ class _Conn:
 
     def call(self, raw: str, arguments: dict) -> str:
         """Invoke one tool and return its result text. Raises on transport/timeout
-        error; a tool-reported error (isError) is returned as text via _render_result."""
+        error; a tool-reported error (is_error) is returned as text via _render_result."""
         timeout = self.spec.get("timeout")
         timeout = timeout if isinstance(timeout, (int, float)) else _CALL_TIMEOUT
         res = self.portal.call(partial(_invoke, self.session, raw, arguments, timeout))
@@ -397,6 +431,16 @@ class _Registry:
     def _connect(self):
         servers, warnings = _load_config(self.cwd)
         self.warnings = list(warnings)
+        if _SDK_ERROR:
+            # Unusable SDK: connect nothing, expose no tools, say so once in /mcp and the
+            # warning footer. Configured servers are still read so the message only fires
+            # for operators who actually have some.
+            if servers:
+                self.warnings.append(
+                    f"MCP disabled — the installed `mcp` SDK is not compatible with this "
+                    f"chad ({_SDK_ERROR}). Reinstall chad, or pin `mcp<2`.")
+                log.warning("mcp: SDK unusable, no servers connected: %s", _SDK_ERROR)
+            return
         trusted = _is_trusted(self.cwd)
 
         # Decide which servers we'll actually connect (after disabled/name/trust gates).
@@ -485,7 +529,7 @@ class _Registry:
             if full in self.by_tool:  # two servers, same tool name — keep first, warn
                 self.warnings.append(f"{full}: duplicate tool name; later copy ignored")
                 continue
-            schema = t.inputSchema
+            schema = t.input_schema
             if not isinstance(schema, dict) or schema.get("type") != "object":
                 schema = {"type": "object", "properties": {}}
             self.by_tool[full] = (conn, raw)
@@ -546,12 +590,15 @@ def _describe(server: str, tool) -> str:
 
 
 def _is_mutating(tool) -> bool:
-    """Whether a tool needs the confirm gate. MCP `annotations.readOnlyHint == true`
-    means the server promises no side effects -> safe to auto-run; anything else is
-    treated as mutating (the safe default: an MCP tool may write files, hit an API, or
-    send a message, and we'd rather over-confirm than act unprompted)."""
+    """Whether a tool needs the confirm gate. MCP `annotations.read_only_hint == true`
+    (readOnlyHint in mcp 1.x — a getattr on the old name would default None and every
+    read-only tool would silently start demanding confirmation; pinned by a test that
+    fails on the 1.x spelling) means the server promises no side effects -> safe to
+    auto-run; anything else is treated as mutating (the safe default: an MCP tool may
+    write files, hit an API, or send a message, and we'd rather over-confirm than act
+    unprompted)."""
     ann = getattr(tool, "annotations", None)
-    if ann is not None and getattr(ann, "readOnlyHint", None) is True:
+    if ann is not None and getattr(ann, "read_only_hint", None) is True:
         return False
     return True
 
@@ -629,7 +676,7 @@ def login(name: str, emit=None) -> str:
         # initialize() triggers the SDK's OAuth flow (401 -> authorize -> browser ->
         # loopback redirect -> token exchange); tokens are persisted by `storage` along
         # the way. We only need the handshake to complete for that to happen.
-        async with streamablehttp_client(url, headers=headers, auth=provider) as streams:
+        async with _http_transport(url, headers, provider) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
                 with anyio.fail_after(mcp_oauth._LOGIN_TIMEOUT + 30):
                     await session.initialize()
@@ -686,7 +733,10 @@ def summary_lines():
     """Human-readable rows for the `/mcp` command: one line per server (transport +
     tool count, or its connection error), each server's tools, then any warnings."""
     reg = service()
-    if not reg.clients and not reg.blocked and not reg.needs_login:
+    # `and not reg.warnings`: a config that produced warnings but no connections (malformed
+    # file, unusable SDK, server with neither url nor command) is NOT "no servers
+    # configured" — that early-out would swallow the one message explaining why.
+    if not reg.clients and not reg.blocked and not reg.needs_login and not reg.warnings:
         return ["no MCP servers configured. Add one to .mcp.json (project) or "
                 "~/.chad/mcp.json (user): "
                 '{"mcpServers": {"name": {"command": "...", "args": [...]}}} '
