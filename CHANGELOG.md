@@ -2,6 +2,90 @@
 
 Notable, user-visible changes.
 
+## [1.0.6] — 2026-07-28
+
+- **Voice mode, all local.** `/speech` in the TUI turns on push-to-talk: ctrl-t opens the
+  mic (a red `● rec` pin in the status line — an open mic you can't see is a bug), ctrl-t
+  again transcribes into the input box. The transcript is *reviewed* text, not a sent
+  message — you read what the model heard and Enter submits, same supervision contract as
+  every edit. Replies are read aloud (code blocks dropped, cut at a sentence boundary;
+  ctrl-c hushes). STT is **Parakeet TDT v3** on MLX — the engine
+  [Hex](https://github.com/kitlangton/Hex) ships as its default, faster than Whisper per
+  clip, more accurate on dictation, and without Whisper's repetition-loop hallucination
+  mode — via a copy vendored into `chad.parakeet` (Apache-2.0, from
+  [parakeet-mlx](https://github.com/senstella/parakeet-mlx)); TTS is macOS `say`. Nothing
+  leaves the machine and the audio never touches disk. Vendoring is deliberate: the PyPI
+  packages drag torch (mlx-whisper, ~2 GB) or librosa's numba/scipy tree (parakeet-mlx)
+  for code paths MLX-format weights never run, so `uv sync --extra speech` adds exactly
+  one package — the mic library (sounddevice). The tokenizer vocabulary rides inside the
+  model repo, so no data blobs ship in chad. Dictation hygiene is built in:
+  trailing/leading silence is trimmed before the model sees it, and a repetition-collapse
+  pass keeps any decode loop out of the input box. The weights are **quantized to 8-bit
+  at load** (no separate quant repo): A/B'd against bf16 on a 24-clip multi-voice
+  battery — transcripts identical up to case/spacing, twice *more* correct — for 786 MB
+  resident instead of 1296 and ~40% faster decode. Tune with `CHAD_STT_MODEL` (default
+  `parakeet-tdt-0.6b-v3`, multilingual; ~2.5 GB fetched on first use), `CHAD_STT_QUANT`
+  (`8` default · `4` halves memory again, clean on the battery but unproven on noisy
+  mics · `none` for bf16), `CHAD_VOICE`, `CHAD_SPEECH_RATE`.
+- **Dictation length is linear, not quadratic.** The encoder ships as `rel_pos` with
+  `att_context_size [-1,-1]` — full global attention, so a take's cost grows with the
+  *square* of its own length, on the same GPU the coding model is resident on. chad now
+  switches it to the banded local kernel at load: the score matrix goes from `T×T` to
+  `(T, 2w+1)`, and w=256 encoder frames is ±20.5s of audio at 12.5 frames/s, so a
+  dictation take still sees its whole self. The transcript is **byte-identical** to full
+  attention on a real clip (and 8-bit local is byte-identical to bf16 local). A 359s take
+  now decodes in 3.9s with peak memory flattening (58s→2.0 GB, 175s→3.1, 359s→3.3) where
+  full attention keeps climbing. The switch happens *before* quantization, because
+  `set_attention_model` rebuilds the attention modules and `load_weights` rejects a
+  quantized layer's scales/biases. A take is also capped at 600s as a backstop: recording
+  doesn't stop and the status line says so, the take just stops growing — a mic left open
+  is truncated, never lost.
+- **`/speech` off gives the memory back, and enable tells you what's broken.** Turning
+  voice mode off now unloads the STT weights (747 MB → 0 measured), not just the mic —
+  it won't fire mid-transcription, where the worker still holds the model. Enable-time
+  validation covers the two failures that were previously invisible until after you'd
+  spoken: a misspelled `CHAD_VOICE` (`say` exits nonzero, so nothing ever raised — you
+  just got silence forever; now it names the typo and suggests the nearest real voice)
+  and a bad `CHAD_STT_QUANT` (which only raised from inside the decode). Both warn rather
+  than block — a machine without `say` can still dictate. And a transcript that finishes
+  after you've turned `/speech` off is discarded with a note instead of typing itself
+  into an input box in a mode you already left.
+- **Voice mode capture + correction, borrowed from the best.** Three ideas adapted from
+  [Hex](https://github.com/kitlangton/Hex) (MIT), the open-source macOS dictation app:
+  while `/speech` is on the mic stays warm feeding a ~1s ring buffer, and each take is
+  seeded with 0.45s of *pre-roll* from before the keypress — opening a CoreAudio device
+  takes 100–300ms, so a cold-opened mic clips your first syllable ("ix the failing
+  test"). The status line says `mic open` the whole time, because an open mic you can't
+  see is a bug; `/speech` off releases it. **esc during a take discards it** instead of
+  transcribing — a mistaken recording shouldn't cost a decode plus an input-box cleanup.
+  And a personal **word table** (`~/.chad/speech_words.json`, or `CHAD_SPEECH_WORDS`) of
+  `{"heard": "meant"}` fixes what no ASR model can — your identifiers: `{"pie test":
+  "pytest", "you vee": "uv"}`. Case-insensitive, whole-word, longest match first,
+  loaded fresh each take; `/speech` reports the count (or the parse error) at enable.
+- **numpy 2 allowed.** The `<2` cap dated to 1.0.0 and encoded no known break — it also
+  blocked modern ASR dependencies that floor at numpy 2. Now `>=1.26,<3`, verified on
+  numpy 2.4.6: full unit gate, live on-device transcription, and `chad prove` 4/4
+  (Ornith 9B smoke model) at normal throughput.
+- **You can see what you're approving.** The confirm prompt used to render into the
+  one-row status line with newlines flattened to `⏎` and a 160-character clip, so a
+  multi-line bash command was unreadable — approving it was approving blind. Approvals
+  now open a panel above the input that shows the command on its own lines (bounded, so a
+  giant heredoc can't swallow the screen), names in plain words what is about to happen
+  ("chad wants to run a terminal command"), and puts the destructive-command warning next
+  to the command instead of in scrollback.
+- **New demo GIF.** The old one predated the banner entirely (no logo, a dead model id,
+  and a fixture that no longer matched the checked-in tape). The new one is a 35B session
+  end to end in 51 seconds: banner, type-ahead while the weights load, the model finding
+  the cent that floor division loses, fixing it, verifying itself, and your own `pytest`
+  confirming it stuck.
+- **`auto-accept edits` now means what it says.** It auto-approved *everything*, bash
+  included. It now auto-approves file edits only — terminal commands and mutating MCP
+  tools still ask, which is the mode most people actually wanted. The old
+  approve-everything behavior is unchanged but now has its own name, `yolo`, still where
+  `--yolo` starts you and now reachable with shift-tab: `normal → auto-accept edits →
+  yolo → plan`. A sub-agent's `tools: "all"` request is honored only under `yolo`, since
+  `all` includes the shell.
+
 ## [1.0.5] — 2026-07-26
 
 The release that makes a 24 GB Mac a first-class target: it runs the 35B now, a Linux

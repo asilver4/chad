@@ -44,10 +44,12 @@ instrument:
 | **Harness**     | open-ended, anything you can imagine            | plan. execute. nothing else.    |
 | **When wrong**  | reasons a way out                               | already shipped                 |
 
-![chad fixing a failing test end to end — reason, read, edit, rerun pytest, all on a local 35B](docs/demo.gif)
+![chad fixing a failing test end to end — reason, read, edit, run pytest, confirm green, all on a local 35B](docs/demo.gif)
 
-> Real session, unedited (cold model load cut): a local 35B reasons through the failure,
-> edits the file, reruns the tests, confirms green.
+> Real session, unedited (the silent prefill is cut): a local 35B finds the cent that
+> floor division loses, fixes it, and verifies itself — then your own `pytest`, in your
+> own shell. Recorded with `--yolo` so nothing pauses for a keypress; the default mode
+> stops and asks before every edit and every command.
 
 ## Frontier scores, laptop cost
 
@@ -134,7 +136,10 @@ it chad uses the tree-sitter fallback automatically.
 `uv run chad` launches a full-screen terminal UI (built on prompt_toolkit):
 
 - **shift-tab cycles permission modes** — `normal` (confirm each bash/write/edit) →
-  `auto-accept edits` → `plan mode` (read-only: investigate + propose a numbered plan) → back.
+  `auto-accept edits` (edits land silently; **terminal commands still ask**) → `yolo`
+  (nothing asks) → `plan mode` (read-only: investigate + propose a numbered plan) → back.
+- **the approval prompt shows what you're approving** — the full command on its own lines
+  above the input, not a clipped single line. Approving blind isn't approving.
 - **type-ahead message queue** — keep typing while the agent works; messages run in order.
 - **ctrl-c interrupts the running turn** without killing the session.
 - **live status line** — model, mode, context %, a state glyph + verb, elapsed seconds, and
@@ -144,6 +149,14 @@ it chad uses the tree-sitter fallback automatically.
   `/model`, `/mode`, `/help`, `/exit`. Same set in the `--repl` line interface.
 - **`@file` / `@dir` mentions** and **`!command` shell passthrough** — pull a file into
   context inline, or run a shell command without invoking the model.
+- **voice mode, all local** — `/speech`, then ctrl-t to talk: Parakeet-on-MLX transcribes
+  into the input box for you to review before Enter sends it (esc discards a take);
+  replies are read aloud via macOS `say`. A pre-roll buffer means your first syllable
+  isn't clipped, and a personal word table (`~/.chad/speech_words.json`) teaches it your
+  identifiers — `{"pie test": "pytest"}`. Dictation cost is linear in take length, so a
+  long thought is fine; `/speech` off releases both the mic and the weights. Nothing
+  leaves the machine. Needs the `speech` extra (`uv sync --extra speech` — just a mic
+  library; no torch, no numba).
 
 **Usage.** `uv run chad --help` is the source of truth:
 

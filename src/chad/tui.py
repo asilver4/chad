@@ -1,7 +1,8 @@
 """Terminal UI for chad — the part that makes it feel like Claude Code.
 
 Features that close the gap with Claude Code's UX:
-  * shift-tab cycles permission modes: normal -> auto-accept edits -> plan mode
+  * shift-tab cycles permission modes:
+      normal -> auto-accept edits -> yolo -> plan mode
   * type-ahead message queue: keep typing while the agent works; messages run in order
   * ctrl-c interrupts the running turn (stops generation) without killing the session
   * inline y/n approval for mutating tools in normal mode
@@ -50,7 +51,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from . import config
+from . import config, guardrails
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
@@ -64,15 +65,60 @@ _STYLE = Style.from_dict({
     "user": "#d7a86e bold",
     "status.normal": "reverse",
     "status.auto": "bg:#3a5f3a #ffffff",
+    "status.yolo": "bg:#6f2a2a #ffffff",
     "status.plan": "bg:#3a3a6f #ffffff",
     "confirm": "bg:#6f5a2a #ffffff",
+    "confirm.title": "#d7a86e bold",
+    "confirm.body": "#e8e8e8",
+    "confirm.danger": "#ff8787 bold",
     "todo.done": "#6b8f6b",
     "todo.cur": "#d7a86e bold",
     "todo.pending": "#8a8a8a",
     "todo.summary": "#8a8a8a",
+    "rec": "#ff8787 bold",
 })
 
-MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "plan": "status.plan"}
+MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "yolo": "status.yolo",
+              "plan": "status.plan"}
+
+# The approval panel's body is bounded so a giant heredoc can't swallow the screen,
+# but generously enough that the thing you're approving is actually readable — the
+# whole point is that a one-line clipped preview means approving blind.
+_CONFIRM_MAX_LINES = 10
+_CONFIRM_MAX_CHARS = 600
+
+
+def _confirm_body_lines(name: str, args) -> list:
+    """The approval preview as real lines, bounded in both directions. Unlike the
+    status line (one row, newlines flattened), this keeps a bash command's structure —
+    pipes, &&-chains and heredocs read as written."""
+    lines = confirm_preview(name, args).splitlines() or [""]
+    extra = len(lines) - _CONFIRM_MAX_LINES
+    if extra > 0:
+        lines = lines[:_CONFIRM_MAX_LINES] + [f"… (+{extra} more lines)"]
+    out, budget = [], _CONFIRM_MAX_CHARS
+    for ln in lines:
+        if budget <= 0:
+            out.append("…")
+            break
+        out.append(ln[:budget])
+        budget -= len(ln)
+    return out
+
+
+def _confirm_title(name: str) -> str:
+    """What the model is asking to do, named in plain words — 'bash' alone doesn't
+    tell you a shell command is about to run on your machine."""
+    if name == "bash":
+        return "run a terminal command"
+    if name.startswith("mcp__"):
+        return f"call the MCP tool {name[len('mcp__'):]}"
+    return {"write": "write a file", "edit": "edit a file",
+            "replace_lines": "replace lines in a file",
+            "insert_lines": "insert lines into a file",
+            "replace_symbol": "replace a symbol", "insert_symbol": "insert a symbol",
+            "rename_symbol": "rename a symbol"}.get(name, f"run {name}")
+
 
 # Spinner frames + the gerund shown next to it, keyed off the latest activity.
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -171,6 +217,7 @@ SLASH_COMMANDS = [
     ("/clear", "clear the conversation + KV cache"),
     ("/model", "show model + context window"),
     ("/mode", "cycle permission mode"),
+    ("/speech", "toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (say)"),
     ("/accept", "accept a pending plan and implement it"),
     ("/exit", "quit chad"),
     ("/quit", "quit chad"),
@@ -324,6 +371,19 @@ class TUI:
         # session without re-listing / a race with new saves).
         self._resume_list = []
 
+        # Voice mode (/speech): push-to-talk dictation + spoken replies, all
+        # on-device (speech.py). Off by default and lazily constructed — the
+        # audio deps are an optional extra, so a non-speech session never
+        # imports them. `_speech_phase` drives the status-line indicator:
+        # "" | "recording" | "transcribing".
+        self.speech_on = False
+        self._speaker = None
+        self._recorder = None
+        self._speech_phase = ""
+        # Mirrored off speech.MAX_TAKE_S at enable so the per-frame status
+        # render never imports the speech module.
+        self._speech_max_s = 0
+
         # Multiline input that auto-grows up to 8 rows. Enter submits; alt-enter
         # (or ctrl-j) inserts a newline; pasted text keeps its newlines.
         self.input = TextArea(
@@ -342,11 +402,20 @@ class TUI:
                    dont_extend_height=True),
             filter=Condition(lambda: bool(_todo_panel_rows(self._todos))),
         )
+        # The approval panel: shown ONLY while a confirm is pending, directly above the
+        # status line. It exists because the status line is one row — a multi-line bash
+        # command flattened into it is unreadable, and approving what you can't read is
+        # not approving. wrap_lines so a long command wraps instead of being clipped.
+        self.confirm_panel = ConditionalContainer(
+            Window(content=FormattedTextControl(self._confirm_fragments),
+                   dont_extend_height=True, wrap_lines=True),
+            filter=Condition(lambda: self._confirm_req is not None),
+        )
         # Only the todo panel + status line + input are owned by prompt_toolkit; the
         # transcript is printed above this region into the terminal's normal scrollback.
         # A FloatContainer hosts the `/` + `@` completion menu.
         root = FloatContainer(
-            HSplit([self.todo_panel, self.status, self.input]),
+            HSplit([self.todo_panel, self.confirm_panel, self.status, self.input]),
             floats=[Float(xcursor=True, ycursor=True,
                           content=CompletionsMenu(max_height=8, scroll_offset=1))],
         )
@@ -467,16 +536,30 @@ class TUI:
 
     # -- UI rendering ----------------------------------------------------
 
+    def _confirm_fragments(self):
+        """The body of the pending approval, rendered above the status line: a header
+        naming what will happen, then the full preview on its own lines."""
+        if not self._confirm_req:
+            return []
+        name, args = self._confirm_req
+        frags = [("class:confirm.title", f" ⏵ chad wants to {_confirm_title(name)}:")]
+        for ln in _confirm_body_lines(name, args):
+            frags += [("", "\n"), ("class:confirm.body", "   " + ln)]
+        # Same screen the agent-side seatbelt uses (agent._confirm), surfaced here so the
+        # warning sits next to the command instead of scrolling past in the transcript.
+        if (name == "bash" and isinstance(args, dict)
+                and guardrails.is_destructive_bash(str(args.get("command", "")))):
+            frags += [("", "\n"),
+                      ("class:confirm.danger", " ⚠ looks destructive — review carefully")]
+        return frags
+
     def _status_fragments(self):
         if self._confirm_req:
-            name, args = self._confirm_req
-            # The status window is a single line (height=1), so flatten the
-            # (possibly multi-line) preview into one clipped line.
-            preview = confirm_preview(name, args).replace("\n", " ⏎ ")
-            if len(preview) > 160:
-                preview = preview[:160] + " …"
+            name, _ = self._confirm_req
+            # The command itself lives in the confirm panel above (multi-line, readable);
+            # this row is just the question and the keys.
             return [("class:confirm",
-                     f" allow {name}({preview})?  [y]es  [n]o ")]
+                     f" approve {name}?  [y]es  [n]o  (esc denies) ")]
         mode = self.agent.mode
         pct = int(100 * self._cur_prompt_tokens / self.ctx_limit) if self.ctx_limit else 0
         qn = len(self._queue)
@@ -510,11 +593,28 @@ class TUI:
                                    f"↓{_kfmt(self._gen_tokens)} · {cap}ctrl-c ")]
         else:
             left = [("class:idle", f" {_phase_glyph(self._phase)} ready ")]
+        # Voice indicator ahead of everything: while the mic is open the user
+        # must be able to see it (an open mic you can't see is a bug, not a feature).
+        if self._speech_phase == "recording":
+            # A capped take is still recording (the mic is honestly open) but no
+            # longer growing — say which, or the user thinks they're being heard.
+            if self._recorder is not None and self._recorder.take_full:
+                left = [("class:rec", f" ● rec — max length ({self._speech_max_s}s) "
+                                      f"reached · ctrl-t transcribes ")] + left
+            else:
+                left = [("class:rec", " ● rec — ctrl-t transcribes · esc discards ")] + left
+        elif self._speech_phase == "transcribing":
+            frame = _SPINNER[(self._tick // 2) % len(_SPINNER)]
+            left = [("class:spinner", f" {frame} transcribing…  ")] + left
         # Model id lives in the startup banner now — no need to repeat it every frame.
         bits = [
             f" {MODE_LABEL[mode]} (shift-tab) ",
             f" ctx {pct}% ",
         ]
+        # The warm-capture contract: while speech mode is on the mic is open
+        # (feeding the pre-roll ring) even when not recording — say so, always.
+        if self.speech_on:
+            bits.append(" mic open (ctrl-t) ")
         if qn:
             bits.append(f" queued:{qn} ")
         sn = len(self._steer_queue)
@@ -604,8 +704,32 @@ class TUI:
             self._confirm_answer = False
             self._confirm_event.set()
 
+        # ctrl-t push-to-talk: first press opens the mic, second press stops and
+        # transcribes into the input box — the transcript is REVIEWED text, not a
+        # submitted message; Enter still sends it. (Overrides emacs transpose-chars,
+        # which nobody will miss.) Active only while /speech is on.
+        speech_on = Condition(lambda: self.speech_on)
+        @kb.add("c-t", filter=speech_on & ~confirming)
+        def _(event):
+            self._toggle_recording()
+            event.app.invalidate()
+
+        # esc during a take discards it without transcribing (Hex parity): a
+        # mistaken recording shouldn't cost a decode + a cleanup of the input
+        # box. ~confirming keeps the confirm-deny esc first; eager so it beats
+        # the non-eager esc=interrupt binding below while the mic is live.
+        rec_active = Condition(lambda: self._speech_phase == "recording")
+        @kb.add("escape", filter=rec_active & ~confirming, eager=True)
+        def _(event):
+            self._recorder.cancel()
+            self._speech_phase = ""
+            self._emit("info", "recording discarded.")
+            event.app.invalidate()
+
         @kb.add("c-c")
         def _(event):
+            if self._speaker:
+                self._speaker.stop()  # ctrl-c also silences a reply mid-sentence
             if self._busy or self._confirm_req:
                 self._interrupt.set()
                 self._confirm_event.set()  # unblock a pending confirm as a denial
@@ -633,6 +757,10 @@ class TUI:
 
     def _shutdown_app(self, event):
         self._shutdown = True
+        if self._speaker:
+            self._speaker.stop()
+        if self._recorder:
+            self._recorder.close()
         self._wake.set()
         self._confirm_event.set()
         event.app.exit()
@@ -724,6 +852,155 @@ class TUI:
         self._resume_list = []
         self._emit("info", f"resumed (forked): {session.describe(pick)}")
 
+    # -- voice mode (/speech) ---------------------------------------------
+
+    def _toggle_speech(self):
+        from . import speech
+        if self.speech_on:
+            was_decoding = self._speech_phase == "transcribing"
+            self.speech_on = False
+            self._speech_phase = ""
+            if self._recorder:
+                self._recorder.close()  # mic fully released, warm ring included
+            if self._speaker:
+                self._speaker.stop()
+            # Hand the STT weights back too — a session that dictated once
+            # shouldn't carry ~790MB on a machine whose coding model already
+            # owns most of RAM. NOT while a decode is in flight: the worker
+            # thread holds a live reference to the model inside generate().
+            # That take is being discarded anyway (see _job), and the next
+            # /speech reloads from the HF cache.
+            freed = False
+            if not was_decoding:
+                freed = speech.release_model()
+            self._emit("info", "speech off — mic released."
+                               + (" stt weights unloaded." if freed else ""))
+            return
+        ok, reason = speech.available()
+        if not ok:
+            self._emit("info", reason)
+            return
+        self._speaker = self._speaker or speech.Speaker()
+        self._recorder = self._recorder or speech.Recorder()
+        # Open the warm stream NOW: the TCC permission prompt fires here, at an
+        # explicit /speech, and a denied mic fails here with the reason —
+        # not silently as an empty take later.
+        try:
+            self._recorder.open_stream()
+        except Exception as e:
+            self._emit("error", f"[mic unavailable: {e}]")
+            return
+        self.speech_on = True
+        self._speech_max_s = int(speech.MAX_TAKE_S)
+        self._emit("info", f"speech on — the mic stays open (see status line) with a "
+                           f"{speech.Recorder.PRE_ROLL_S:.2g}s pre-roll so your first "
+                           f"word isn't clipped. ctrl-t to talk, ctrl-t again to "
+                           f"transcribe, esc discards a take; replies are read aloud "
+                           f"(ctrl-c hushes). all local: {speech.stt_model()} + macOS say.")
+        try:
+            n = len(speech.load_remaps())
+            if n:
+                self._emit("info", f"  {n} word remap(s) active from {speech.remap_path()}")
+        except (ValueError, OSError) as e:
+            self._emit("info", f"  word remaps IGNORED — {speech.remap_path()}: {e}")
+        # Everything voice mode depends on that ISN'T the mic gets checked here,
+        # while the fix is still cheap. Both failures are otherwise invisible
+        # until after you've spoken: a bad CHAD_VOICE never raises (say exits
+        # nonzero and Speaker swallows it), and a bad CHAD_STT_QUANT raises
+        # inside transcribe(), i.e. once the take is already recorded.
+        for ok, reason in (speech.tts_status(), speech.stt_status()):
+            if not ok:
+                self._emit("info", f"  {reason}")
+        if not speech.model_cached():
+            self._emit("info", "  STT weights aren't cached yet — the first "
+                               "ctrl-t transcription downloads them once (the "
+                               "status line shows 'transcribing' meanwhile)")
+
+    def _toggle_recording(self):
+        """ctrl-t handler (UI thread). STT runs on a helper thread so the
+        first-use model download/load can't freeze the input loop; the finished
+        transcript is inserted back on the event loop, where buffer edits belong.
+
+        Three threads touch voice mode, and only one of them may touch the
+        prompt_toolkit buffer. Who owns what:
+
+            CoreAudio callback          UI thread (event loop)      chad-stt worker
+            ──────────────────          ──────────────────────      ───────────────
+            Recorder._on_audio          ctrl-t ─► _toggle_recording
+              ring/take append            │
+              (holds Recorder._lock)      ├─ start()  phase ""─►"recording"
+                                          │
+                                          ├─ stop()   phase ─►"transcribing"
+                                          │      └─ spawn ──────────► _job
+                                          │                             │
+                                          │                    speech.transcribe
+                                          │                    (model load, GPU)
+                                          │                             │
+                                          │                     phase ─► ""
+                                          │        app.invalidate() ◄────┤ (safe:
+                                          │                             │  ptk does
+                                          │                             │  the hop)
+                                    buffer.insert_text ◄────────────────┘ via
+                                          │                    loop.call_soon_threadsafe
+                                          ▼
+                                    reviewed text; Enter still sends it
+
+        The worker NEVER touches self.input.buffer directly — every buffer edit
+        crosses back through call_soon_threadsafe. app.invalidate() is the one
+        exception it may call outright, because prompt_toolkit does that hop
+        itself.
+        """
+        from . import speech
+        if self._speech_phase == "transcribing":
+            return  # previous utterance still decoding; one at a time
+        if not self._recorder.recording:
+            self._speaker.stop()  # never transcribe our own TTS
+            try:
+                self._recorder.start()
+            except Exception as e:  # stream died since /speech (device unplugged)
+                self._emit("error", f"[mic unavailable: {e}]")
+                return
+            self._speech_phase = "recording"
+            return
+        audio = self._recorder.stop()
+        self._speech_phase = "transcribing"
+        loop = self.app.loop
+
+        def _job():
+            try:
+                text = speech.transcribe(audio)
+            except Exception as e:
+                self._emit("error", f"[transcription failed: {e}]")
+                return
+            finally:
+                self._speech_phase = ""
+                self.app.invalidate()
+            if not text:
+                self._emit("info", "heard nothing.")
+                return
+            # /speech may have been turned off while this decode ran — on first
+            # use that window includes the one-time model download. Text
+            # appearing in the input box from a mode the user already left
+            # reads as a bug, so drop it, and say so rather than swallowing it.
+            if not self.speech_on:
+                self._emit("info", "speech was turned off — transcript discarded.")
+                return
+            if loop is not None:
+                loop.call_soon_threadsafe(self.input.buffer.insert_text, text)
+        threading.Thread(target=_job, daemon=True, name="chad-stt").start()
+
+    def _speak_reply(self):
+        """Read the turn's final prose aloud (worker thread; `say` is a detached
+        subprocess, so this never blocks the next queued turn)."""
+        from . import speech
+        from .toolcall_parse import strip_think
+        for m in reversed(self.agent.messages):
+            if m.get("role") == "assistant":
+                text = speech.spoken_text(strip_think(m.get("content") or ""))
+                if text:
+                    self._speaker.speak(text)
+                return
+
     # -- input handling --------------------------------------------------
 
     def _on_accept(self, buff):
@@ -751,6 +1028,9 @@ class TUI:
             return False
         if text == "/mode":
             self.agent.cycle_mode()
+            return False
+        if text == "/speech":
+            self._toggle_speech()
             return False
         if text == "/compact":
             # Manual context reclaim. Refuse mid-turn (mutating messages under the
@@ -801,9 +1081,10 @@ class TUI:
                 self._emit("info", "  " + ln)
             return False
         if text == "/help":
-            self._emit("info", "shift-tab: cycle mode (normal/auto/plan) · esc/ctrl-c: "
+            self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
+                               "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/resume /reset /clear /compact /model /mode /accept /exit · !cmd shell · @path "
+                               "/resume /reset /clear /compact /model /mode /speech /accept /exit · !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
                                "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
@@ -886,6 +1167,8 @@ class TUI:
                 else:
                     self.agent.run_turn(msg, stream=True)
                     self.agent.save()  # persist conversation for --continue
+                    if self.speech_on and self._speaker:
+                        self._speak_reply()
                     # Governor hard-stop: the turn ran out of budget with no
                     # landed+verified change. Surface the banked progress note and arm the
                     # fresh-continue handoff — the next typed message starts clean, seeded.
